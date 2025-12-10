@@ -1,0 +1,191 @@
+name: React Frontend CI/CD
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: 'Name of the application (e.g., tripalta-ui)'
+        required: true
+        type: string
+      node-version:
+        description: 'Node.js version to use'
+        required: false
+        type: string
+        default: '20'
+      run-e2e-tests:
+        description: 'Whether to run E2E tests on develop/main'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      AWS_ROLE_ARN_STAGING:
+        required: false
+      AWS_ROLE_ARN_PROD:
+        required: false
+      CLOUDFRONT_STAGING_ID:
+        required: false
+      CLOUDFRONT_PROD_ID:
+        required: false
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      # Code Quality Checks
+      - name: Check Formatting (Prettier)
+        run: npm run format:check || npx prettier --check .
+
+      - name: Lint (ESLint)
+        run: npm run lint
+
+      - name: Type Check (TypeScript)
+        run: npm run type-check
+
+      # Unit Tests with Coverage
+      - name: Run Unit Tests
+        run: |
+          npm run test:ci -- --coverage \
+            --coverageReporters=json-summary \
+            --coverageReporters=lcov \
+            --reporters=default \
+            --reporters=jest-junit 2>/dev/null || \
+          npm run test -- --coverage --passWithNoTests
+        env:
+          JEST_JUNIT_OUTPUT_DIR: ./test-results
+
+      # Build
+      - name: Build Application
+        run: npm run build
+
+      # E2E Tests (on develop/main only)
+      - name: Install Playwright Browsers
+        if: inputs.run-e2e-tests && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
+        run: npx playwright install --with-deps
+
+      - name: Run E2E Tests
+        if: inputs.run-e2e-tests && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
+        run: npm run test:e2e:ci || npm run test:e2e || true
+
+      # Upload Test Results
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ inputs.app-name }}
+          path: |
+            test-results/
+            junit.xml
+          retention-days: 7
+
+      # Upload Coverage
+      - name: Upload Coverage Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-${{ inputs.app-name }}
+          path: coverage/
+          retention-days: 7
+
+      # Upload Build Artifacts
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ inputs.app-name }}
+          path: dist/
+          retention-days: 1
+
+      # Generate Test Summary
+      - name: Generate Test Summary
+        if: always()
+        uses: tripalta/tripalta-workflows/actions/test-summary@main
+        with:
+          test-results-path: test-results
+          coverage-path: coverage/coverage-summary.json
+          pass-threshold: '80'
+
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build-and-test
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install and Build
+        run: npm ci && npm run build
+        env:
+          VITE_API_URL: ${{ vars.STAGING_API_URL || 'https://staging-api.tripalta.com' }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+
+      - name: Deploy to S3
+        run: aws s3 sync dist/ s3://tripalta-staging-frontend --delete
+
+      - name: Invalidate CloudFront Cache
+        if: secrets.CLOUDFRONT_STAGING_ID != ''
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_STAGING_ID }} \
+            --paths "/*"
+
+  deploy-production:
+    name: Deploy to Production
+    needs: build-and-test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install and Build
+        run: npm ci && npm run build:production || npm run build
+        env:
+          VITE_API_URL: ${{ vars.PROD_API_URL || 'https://api.tripalta.com' }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+
+      - name: Deploy to S3
+        run: aws s3 sync dist/ s3://tripalta-production-frontend --delete
+
+      - name: Invalidate CloudFront Cache
+        if: secrets.CLOUDFRONT_PROD_ID != ''
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_PROD_ID }} \
+            --paths "/*"

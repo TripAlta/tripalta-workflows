@@ -1,0 +1,65 @@
+name: 'Test Summary'
+description: 'Generate beautiful test summary with pass/fail threshold enforcement'
+inputs:
+  test-results-path:
+    description: 'Path to test results (JUnit XML, Jest JSON, or directory)'
+    required: true
+  coverage-path:
+    description: 'Path to coverage report (JaCoCo XML or Jest JSON)'
+    required: false
+  pass-threshold:
+    description: 'Minimum pass percentage required (default: 80)'
+    required: false
+    default: '80'
+  test-framework:
+    description: 'Test framework: junit, jest, pytest, or auto'
+    required: false
+    default: 'auto'
+
+outputs:
+  total:
+    description: 'Total number of tests'
+    value: ${{ steps.summary.outputs.total }}
+  passed:
+    description: 'Number of passed tests'
+    value: ${{ steps.summary.outputs.passed }}
+  failed:
+    description: 'Number of failed tests'
+    value: ${{ steps.summary.outputs.failed }}
+  skipped:
+    description: 'Number of skipped tests'
+    value: ${{ steps.summary.outputs.skipped }}
+  pass-rate:
+    description: 'Pass rate percentage'
+    value: ${{ steps.summary.outputs.pass_rate }}
+  threshold-met:
+    description: 'Whether the pass threshold was met'
+    value: ${{ steps.summary.outputs.threshold_met }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install Dependencies
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: npm ci --silent 2>/dev/null || npm install --silent
+
+    - name: Generate Test Summary
+      id: summary
+      shell: bash
+      env:
+        TEST_RESULTS_PATH: ${{ inputs.test-results-path }}
+        COVERAGE_PATH: ${{ inputs.coverage-path }}
+        PASS_THRESHOLD: ${{ inputs.pass-threshold }}
+        TEST_FRAMEWORK: ${{ inputs.test-framework }}
+      run: |
+        node ${{ github.action_path }}/generate-summary.js \
+          --results "$TEST_RESULTS_PATH" \
+          --coverage "$COVERAGE_PATH" \
+          --threshold "$PASS_THRESHOLD" \
+          --framework "$TEST_FRAMEWORK"

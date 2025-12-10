@@ -1,0 +1,20 @@
+{
+  "name": "@tripalta/test-summary-action",
+  "version": "1.0.0",
+  "description": "GitHub Action to generate beautiful test summaries with threshold enforcement",
+  "main": "generate-summary.js",
+  "scripts": {
+    "test": "node generate-summary.js --help"
+  },
+  "keywords": [
+    "github-action",
+    "test-summary",
+    "ci-cd",
+    "tripalta"
+  ],
+  "author": "TripAlta",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

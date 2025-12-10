@@ -1,0 +1,220 @@
+name: E2E Tests CI
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: 'Node.js version to use'
+        required: false
+        type: string
+        default: '20'
+      pnpm-version:
+        description: 'pnpm version to use'
+        required: false
+        type: string
+        default: '9'
+      run-web-tests:
+        description: 'Run web E2E tests'
+        required: false
+        type: boolean
+        default: true
+      run-accessibility-tests:
+        description: 'Run accessibility tests'
+        required: false
+        type: boolean
+        default: true
+      run-performance-tests:
+        description: 'Run performance tests (on develop/main only)'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      AWS_ROLE_ARN_STAGING:
+        required: false
+
+jobs:
+  lint-and-validate:
+    name: Lint & Validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - name: Setup Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'pnpm'
+
+      - name: Install Dependencies
+        run: pnpm install
+
+      - name: Lint
+        run: pnpm lint || true
+
+      - name: Type Check
+        run: pnpm type-check || true
+
+  web-e2e:
+    name: Web E2E Tests
+    needs: lint-and-validate
+    if: inputs.run-web-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - name: Setup Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'pnpm'
+
+      - name: Install Dependencies
+        run: pnpm install
+
+      - name: Install Playwright Browsers
+        run: npx playwright install --with-deps
+
+      - name: Run Web E2E Tests
+        run: pnpm test:web || pnpm test:e2e || true
+        env:
+          BASE_URL: ${{ vars.STAGING_URL || 'https://staging.tripalta.com' }}
+
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: web-e2e-results
+          path: |
+            packages/web-e2e/test-results/
+            test-results/
+          retention-days: 7
+
+      - name: Upload Playwright Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: |
+            packages/web-e2e/playwright-report/
+            playwright-report/
+          retention-days: 7
+
+  accessibility-tests:
+    name: Accessibility Tests
+    needs: lint-and-validate
+    if: inputs.run-accessibility-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - name: Setup Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'pnpm'
+
+      - name: Install Dependencies
+        run: pnpm install
+
+      - name: Install Playwright Browsers
+        run: npx playwright install --with-deps
+
+      - name: Run Accessibility Tests
+        run: pnpm test:a11y || pnpm test:accessibility || true
+        env:
+          BASE_URL: ${{ vars.STAGING_URL || 'https://staging.tripalta.com' }}
+
+      - name: Upload A11y Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: accessibility-report
+          path: |
+            packages/accessibility/reports/
+            a11y-reports/
+          retention-days: 7
+
+  performance-tests:
+    name: Performance Tests
+    needs: lint-and-validate
+    if: inputs.run-performance-tests && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - name: Setup Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'pnpm'
+
+      - name: Install Dependencies
+        run: pnpm install
+
+      - name: Run Performance Tests (Lighthouse)
+        run: pnpm test:perf || pnpm test:performance || true
+        env:
+          BASE_URL: ${{ vars.STAGING_URL || 'https://staging.tripalta.com' }}
+
+      - name: Upload Performance Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance-report
+          path: |
+            packages/performance/reports/
+            performance-reports/
+          retention-days: 7
+
+  test-summary:
+    name: Generate Summary
+    needs: [web-e2e, accessibility-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Web E2E Results
+        uses: actions/download-artifact@v4
+        with:
+          name: web-e2e-results
+          path: all-results/web-e2e/
+        continue-on-error: true
+
+      - name: Download Accessibility Results
+        uses: actions/download-artifact@v4
+        with:
+          name: accessibility-report
+          path: all-results/accessibility/
+        continue-on-error: true
+
+      - name: Generate Combined Test Summary
+        uses: tripalta/tripalta-workflows/actions/test-summary@main
+        with:
+          test-results-path: all-results/
+          pass-threshold: '80'

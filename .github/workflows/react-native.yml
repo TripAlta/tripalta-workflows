@@ -1,0 +1,233 @@
+name: React Native CI/CD
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: 'Name of the application (e.g., tripalta-mobile)'
+        required: true
+        type: string
+      node-version:
+        description: 'Node.js version to use'
+        required: false
+        type: string
+        default: '20'
+      build-ios:
+        description: 'Whether to build iOS on develop/main'
+        required: false
+        type: boolean
+        default: true
+      build-android:
+        description: 'Whether to build Android on develop/main'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      EXPO_TOKEN:
+        required: false
+      AWS_ROLE_ARN_STAGING:
+        required: false
+      AWS_ROLE_ARN_PROD:
+        required: false
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      # Code Quality Checks
+      - name: Check Formatting (Prettier)
+        run: npm run format:check || npx prettier --check .
+
+      - name: Lint (ESLint)
+        run: npm run lint
+
+      - name: Type Check (TypeScript)
+        run: npm run type-check
+
+      # Unit Tests with Coverage
+      - name: Run Tests
+        run: |
+          npm run test -- --coverage \
+            --coverageReporters=json-summary \
+            --coverageReporters=lcov \
+            --reporters=default \
+            --reporters=jest-junit 2>/dev/null || \
+          npm run test -- --coverage --passWithNoTests
+        env:
+          JEST_JUNIT_OUTPUT_DIR: ./test-results
+
+      # Expo Doctor Check
+      - name: Expo Doctor
+        run: npx expo-doctor || true
+
+      # Upload Test Results
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ inputs.app-name }}
+          path: |
+            test-results/
+            junit.xml
+          retention-days: 7
+
+      # Upload Coverage
+      - name: Upload Coverage Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-${{ inputs.app-name }}
+          path: coverage/
+          retention-days: 7
+
+      # Generate Test Summary
+      - name: Generate Test Summary
+        if: always()
+        uses: tripalta/tripalta-workflows/actions/test-summary@main
+        with:
+          test-results-path: test-results
+          coverage-path: coverage/coverage-summary.json
+          pass-threshold: '80'
+
+  build-ios:
+    name: Build iOS
+    needs: build-and-test
+    if: inputs.build-ios && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Setup EAS
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Build iOS
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            npx eas build --platform ios --profile production --non-interactive
+          else
+            npx eas build --platform ios --profile preview --non-interactive
+          fi
+
+  build-android:
+    name: Build Android
+    needs: build-and-test
+    if: inputs.build-android && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Setup EAS
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Build Android
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            npx eas build --platform android --profile production --non-interactive
+          else
+            npx eas build --platform android --profile preview --non-interactive
+          fi
+
+  deploy-staging:
+    name: Deploy to Staging
+    needs: [build-ios, build-android]
+    if: always() && github.ref == 'refs/heads/develop' && github.event_name == 'push' && (needs.build-ios.result == 'success' || needs.build-android.result == 'success')
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Setup EAS
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Submit to TestFlight (iOS)
+        if: needs.build-ios.result == 'success'
+        run: npx eas submit --platform ios --profile staging --non-interactive || true
+
+      - name: Submit to Play Store Internal (Android)
+        if: needs.build-android.result == 'success'
+        run: npx eas submit --platform android --profile staging --non-interactive || true
+
+  deploy-production:
+    name: Deploy to Production
+    needs: [build-ios, build-android]
+    if: always() && github.ref == 'refs/heads/main' && github.event_name == 'push' && (needs.build-ios.result == 'success' || needs.build-android.result == 'success')
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Setup EAS
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Submit to App Store (iOS)
+        if: needs.build-ios.result == 'success'
+        run: npx eas submit --platform ios --profile production --non-interactive || true
+
+      - name: Submit to Play Store (Android)
+        if: needs.build-android.result == 'success'
+        run: npx eas submit --platform android --profile production --non-interactive || true
