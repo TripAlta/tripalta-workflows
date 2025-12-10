@@ -1,0 +1,199 @@
+# Dependabot Configuration for TripAlta
+# This file should be copied to each repository's .github/ directory
+# or repositories can reference this as a template
+
+version: 2
+updates:
+  # Maven dependencies (Java services)
+  - package-ecosystem: "maven"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 10
+    reviewers:
+      - "tripalta/backend-team"
+    labels:
+      - "dependencies"
+      - "java"
+    commit-message:
+      prefix: "deps(java)"
+    groups:
+      spring-boot:
+        patterns:
+          - "org.springframework*"
+        update-types:
+          - "minor"
+          - "patch"
+      spring-cloud:
+        patterns:
+          - "org.springframework.cloud*"
+      testing:
+        patterns:
+          - "org.junit*"
+          - "org.mockito*"
+          - "org.testcontainers*"
+      security:
+        patterns:
+          - "org.owasp*"
+          - "com.google.errorprone*"
+
+  # npm dependencies (Frontend/Mobile)
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 10
+    reviewers:
+      - "tripalta/frontend-team"
+    labels:
+      - "dependencies"
+      - "javascript"
+    commit-message:
+      prefix: "deps(npm)"
+    groups:
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "react-router*"
+          - "@types/react*"
+        update-types:
+          - "minor"
+          - "patch"
+      tanstack:
+        patterns:
+          - "@tanstack/*"
+      testing:
+        patterns:
+          - "jest"
+          - "@jest/*"
+          - "@testing-library/*"
+          - "playwright"
+          - "@playwright/*"
+      linting:
+        patterns:
+          - "eslint"
+          - "eslint-*"
+          - "@typescript-eslint/*"
+          - "prettier"
+      build-tools:
+        patterns:
+          - "vite"
+          - "@vitejs/*"
+          - "typescript"
+          - "esbuild"
+      expo:
+        patterns:
+          - "expo"
+          - "expo-*"
+          - "@expo/*"
+      react-native:
+        patterns:
+          - "react-native"
+          - "react-native-*"
+          - "@react-native/*"
+          - "nativewind"
+
+  # pip dependencies (Python/AI service)
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 10
+    reviewers:
+      - "tripalta/ai-team"
+    labels:
+      - "dependencies"
+      - "python"
+    commit-message:
+      prefix: "deps(python)"
+    groups:
+      fastapi:
+        patterns:
+          - "fastapi"
+          - "uvicorn"
+          - "starlette"
+          - "pydantic*"
+      testing:
+        patterns:
+          - "pytest*"
+          - "coverage"
+          - "httpx"
+      linting:
+        patterns:
+          - "black"
+          - "isort"
+          - "flake8*"
+          - "mypy*"
+      security:
+        patterns:
+          - "bandit"
+          - "safety"
+          - "pip-audit"
+
+  # Terraform modules (Infrastructure)
+  - package-ecosystem: "terraform"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+      time: "09:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "tripalta/platform-team"
+    labels:
+      - "dependencies"
+      - "terraform"
+    commit-message:
+      prefix: "deps(terraform)"
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "tripalta/platform-team"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "deps(actions)"
+    groups:
+      aws-actions:
+        patterns:
+          - "aws-actions/*"
+      github-actions:
+        patterns:
+          - "actions/*"
+
+  # Docker base images
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+      time: "09:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 3
+    reviewers:
+      - "tripalta/platform-team"
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "deps(docker)"

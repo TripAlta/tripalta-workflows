@@ -17,6 +17,21 @@ on:
         required: false
         type: boolean
         default: true
+      enable-slack-notifications:
+        description: 'Whether to send Slack notifications'
+        required: false
+        type: boolean
+        default: true
+      enable-bundle-size-check:
+        description: 'Whether to check bundle size changes'
+        required: false
+        type: boolean
+        default: true
+      enable-pr-preview:
+        description: 'Whether to deploy PR preview environments'
+        required: false
+        type: boolean
+        default: true
     secrets:
       AWS_ROLE_ARN_STAGING:
         required: false
@@ -26,6 +41,15 @@ on:
         required: false
       CLOUDFRONT_PROD_ID:
         required: false
+      SLACK_WEBHOOK_URL:
+        required: false
+      AWS_ROLE_ARN_PREVIEW:
+        required: false
+
+# Cancel in-progress runs for the same workflow and ref
+concurrency:
+  group: react-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-and-test:
@@ -45,6 +69,16 @@ jobs:
       - name: Install Dependencies
         run: npm ci
 
+      # Security scanning
+      - name: Security Audit
+        run: |
+          npm audit --audit-level=high 2>&1 | tee npm-audit.txt || true
+          # Fail on critical vulnerabilities
+          if npm audit --audit-level=critical 2>&1 | grep -q "critical"; then
+            echo "::error::Critical vulnerabilities found in dependencies"
+            exit 1
+          fi
+
       # Code Quality Checks
       - name: Check Formatting (Prettier)
         run: npm run format:check || npx prettier --check .
@@ -55,15 +89,16 @@ jobs:
       - name: Type Check (TypeScript)
         run: npm run type-check
 
-      # Unit Tests with Coverage
+      # Unit Tests with Coverage (parallel execution)
       - name: Run Unit Tests
         run: |
           npm run test:ci -- --coverage \
             --coverageReporters=json-summary \
             --coverageReporters=lcov \
             --reporters=default \
-            --reporters=jest-junit 2>/dev/null || \
-          npm run test -- --coverage --passWithNoTests
+            --reporters=jest-junit \
+            --maxWorkers=4 2>/dev/null || \
+          npm run test -- --coverage --passWithNoTests --maxWorkers=4
         env:
           JEST_JUNIT_OUTPUT_DIR: ./test-results
 
@@ -71,14 +106,25 @@ jobs:
       - name: Build Application
         run: npm run build
 
-      # E2E Tests (on develop/main only)
+      # Bundle Size Check
+      - name: Check Bundle Size
+        if: inputs.enable-bundle-size-check && github.event_name == 'pull_request'
+        uses: preactjs/compressed-size-action@v2
+        with:
+          repo-token: ${{ github.token }}
+          build-script: "build"
+          pattern: "dist/**/*.{js,css,html}"
+          compression: "gzip"
+        continue-on-error: true
+
+      # E2E Tests (on develop/main only) - Now blocking
       - name: Install Playwright Browsers
         if: inputs.run-e2e-tests && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
         run: npx playwright install --with-deps
 
       - name: Run E2E Tests
         if: inputs.run-e2e-tests && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
-        run: npm run test:e2e:ci || npm run test:e2e || true
+        run: npm run test:e2e:ci || npm run test:e2e
 
       # Upload Test Results
       - name: Upload Test Results
@@ -89,7 +135,7 @@ jobs:
           path: |
             test-results/
             junit.xml
-          retention-days: 7
+          retention-days: 30
 
       # Upload Coverage
       - name: Upload Coverage Report
@@ -97,7 +143,16 @@ jobs:
         with:
           name: coverage-report-${{ inputs.app-name }}
           path: coverage/
-          retention-days: 7
+          retention-days: 30
+
+      # Upload Security Audit
+      - name: Upload Security Audit
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-audit-${{ inputs.app-name }}
+          path: npm-audit.txt
+          retention-days: 30
 
       # Upload Build Artifacts
       - name: Upload Build Artifacts
@@ -105,7 +160,7 @@ jobs:
         with:
           name: build-${{ inputs.app-name }}
           path: dist/
-          retention-days: 1
+          retention-days: 7
 
       # Generate Test Summary
       - name: Generate Test Summary
@@ -115,6 +170,181 @@ jobs:
           test-results-path: test-results
           coverage-path: coverage/coverage-summary.json
           pass-threshold: '80'
+
+      # Notify on build failure
+      - name: Notify Slack on Build Failure
+        if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":x: Build Failed: ${{ inputs.app-name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: *Build Failed*\n*App:* ${{ inputs.app-name }}\n*Branch:* ${{ github.ref_name }}\n*Author:* ${{ github.actor }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "View Workflow"},
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # PR Preview Deployment - Ephemeral environments for pull requests
+  deploy-pr-preview:
+    name: Deploy PR Preview
+    needs: build-and-test
+    if: github.event_name == 'pull_request' && inputs.enable-pr-preview
+    runs-on: ubuntu-latest
+    environment:
+      name: pr-preview-${{ github.event.pull_request.number }}
+      url: ${{ steps.deploy.outputs.preview_url }}
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install and Build
+        run: npm ci && npm run build
+        env:
+          VITE_API_URL: ${{ vars.STAGING_API_URL || 'https://staging-api.tripalta.com' }}
+          VITE_ENVIRONMENT: preview
+
+      - name: Configure AWS Credentials
+        if: secrets.AWS_ROLE_ARN_PREVIEW != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PREVIEW }}
+
+      - name: Deploy to S3 Preview Bucket
+        id: deploy
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PREVIEW_PATH="pr-${PR_NUMBER}"
+          BUCKET_NAME="${{ vars.PREVIEW_BUCKET_NAME || 'tripalta-preview-frontend' }}"
+
+          # Deploy to S3 under PR-specific path
+          aws s3 sync dist/ "s3://${BUCKET_NAME}/${PREVIEW_PATH}/" --delete
+
+          # Set preview URL output
+          PREVIEW_URL="${{ vars.PREVIEW_BASE_URL || 'https://preview.tripalta.com' }}/${PREVIEW_PATH}/"
+          echo "preview_url=${PREVIEW_URL}" >> $GITHUB_OUTPUT
+          echo "Preview deployed to: ${PREVIEW_URL}"
+
+      - name: Comment PR with Preview URL
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const previewUrl = '${{ steps.deploy.outputs.preview_url }}';
+            const prNumber = context.payload.pull_request.number;
+
+            // Find existing preview comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+
+            const botComment = comments.find(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('Preview Deployment')
+            );
+
+            const body = `## 🚀 Preview Deployment
+
+            | Status | URL |
+            |--------|-----|
+            | ✅ Ready | [${previewUrl}](${previewUrl}) |
+
+            **Commit:** \`${{ github.sha }}\`
+            **Updated:** ${new Date().toISOString()}
+
+            > This preview will be automatically cleaned up when the PR is closed.`;
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: body
+              });
+            }
+
+      - name: Notify Slack on PR Preview
+        if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":eyes: PR Preview Ready: ${{ inputs.app-name }} #${{ github.event.pull_request.number }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":eyes: *PR Preview Ready*\n*App:* ${{ inputs.app-name }}\n*PR:* #${{ github.event.pull_request.number }}\n*URL:* ${{ steps.deploy.outputs.preview_url }}\n*Author:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # Cleanup PR Preview on PR close
+  cleanup-pr-preview:
+    name: Cleanup PR Preview
+    if: github.event_name == 'pull_request' && github.event.action == 'closed' && inputs.enable-pr-preview
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Configure AWS Credentials
+        if: secrets.AWS_ROLE_ARN_PREVIEW != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PREVIEW }}
+
+      - name: Delete PR Preview from S3
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PREVIEW_PATH="pr-${PR_NUMBER}"
+          BUCKET_NAME="${{ vars.PREVIEW_BUCKET_NAME || 'tripalta-preview-frontend' }}"
+
+          echo "Cleaning up preview for PR #${PR_NUMBER}..."
+          aws s3 rm "s3://${BUCKET_NAME}/${PREVIEW_PATH}/" --recursive || true
+          echo "Preview cleanup completed"
 
   deploy-staging:
     name: Deploy to Staging
@@ -137,6 +367,14 @@ jobs:
         env:
           VITE_API_URL: ${{ vars.STAGING_API_URL || 'https://staging-api.tripalta.com' }}
 
+      - name: Create GitHub Deployment
+        id: deploy
+        uses: chrnorm/deployment-action@v2
+        with:
+          token: ${{ github.token }}
+          environment: staging
+          ref: ${{ github.sha }}
+
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -153,12 +391,80 @@ jobs:
             --distribution-id ${{ secrets.CLOUDFRONT_STAGING_ID }} \
             --paths "/*"
 
+      # Smoke test
+      - name: Smoke Test
+        run: |
+          sleep 30
+          STAGING_URL="${{ vars.STAGING_FRONTEND_URL || 'https://staging.tripalta.com' }}"
+          for i in {1..5}; do
+            if curl -sf --max-time 10 "$STAGING_URL" > /dev/null 2>&1; then
+              echo "Staging site is accessible"
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "::warning::Could not verify staging site accessibility"
+
+      - name: Update Deployment Status
+        if: always()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: ${{ github.token }}
+          state: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deployment-id: ${{ steps.deploy.outputs.deployment_id }}
+          environment-url: ${{ vars.STAGING_FRONTEND_URL || 'https://staging.tripalta.com' }}
+
+      - name: Notify Slack on Staging Deployment
+        if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":rocket: Deployed to Staging: ${{ inputs.app-name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":rocket: *Deployed to Staging*\n*App:* ${{ inputs.app-name }}\n*URL:* ${{ vars.STAGING_FRONTEND_URL || 'https://staging.tripalta.com' }}\n*Author:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Notify Slack on Staging Failure
+        if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":warning: Staging Deployment Failed: ${{ inputs.app-name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":warning: *Staging Deployment Failed*\n*App:* ${{ inputs.app-name }}\n*Branch:* ${{ github.ref_name }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
   deploy-production:
     name: Deploy to Production
     needs: build-and-test
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
-    environment: production
+    environment:
+      name: production
+      url: https://tripalta.com
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -173,6 +479,14 @@ jobs:
         run: npm ci && npm run build:production || npm run build
         env:
           VITE_API_URL: ${{ vars.PROD_API_URL || 'https://api.tripalta.com' }}
+
+      - name: Create GitHub Deployment
+        id: deploy
+        uses: chrnorm/deployment-action@v2
+        with:
+          token: ${{ github.token }}
+          environment: production
+          ref: ${{ github.sha }}
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -189,3 +503,92 @@ jobs:
           aws cloudfront create-invalidation \
             --distribution-id ${{ secrets.CLOUDFRONT_PROD_ID }} \
             --paths "/*"
+
+      # Smoke test
+      - name: Smoke Test
+        run: |
+          sleep 30
+          PROD_URL="${{ vars.PROD_FRONTEND_URL || 'https://tripalta.com' }}"
+          for i in {1..5}; do
+            if curl -sf --max-time 10 "$PROD_URL" > /dev/null 2>&1; then
+              echo "Production site is accessible"
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "::warning::Could not verify production site accessibility"
+
+      - name: Update Deployment Status
+        if: always()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: ${{ github.token }}
+          state: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deployment-id: ${{ steps.deploy.outputs.deployment_id }}
+          environment-url: ${{ vars.PROD_FRONTEND_URL || 'https://tripalta.com' }}
+
+      # Generate changelog
+      - name: Generate Changelog
+        if: success()
+        uses: mikepenz/release-changelog-builder-action@v4
+        id: changelog
+        with:
+          configuration: ".github/changelog-config.json"
+          ignorePreReleases: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        continue-on-error: true
+
+      - name: Notify Slack on Production Deployment
+        if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":white_check_mark: Deployed to Production: ${{ inputs.app-name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: *Deployed to Production*\n*App:* ${{ inputs.app-name }}\n*URL:* ${{ vars.PROD_FRONTEND_URL || 'https://tripalta.com' }}\n*Author:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Notify Slack on Production Failure
+        if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":rotating_light: PRODUCTION Deployment Failed: ${{ inputs.app-name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":rotating_light: *PRODUCTION Deployment Failed*\n*App:* ${{ inputs.app-name }}\n*Branch:* main"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "View Workflow"},
+                      "style": "danger",
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
