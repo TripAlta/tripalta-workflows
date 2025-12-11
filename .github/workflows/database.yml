@@ -32,13 +32,6 @@ on:
         required: false
         type: boolean
         default: false
-    secrets:
-      AWS_ROLE_ARN_STAGING:
-        required: false
-      AWS_ROLE_ARN_PROD:
-        required: false
-      SLACK_WEBHOOK_URL:
-        required: false
 
 concurrency:
   group: database-${{ github.workflow }}-${{ github.ref }}
