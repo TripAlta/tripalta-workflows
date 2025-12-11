@@ -277,9 +277,6 @@ jobs:
       inputs.use-ecs-migration &&
       github.event_name == 'push' &&
       (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
-    permissions:
-      id-token: write
-      contents: read
     outputs:
       image-tag: ${{ steps.meta.outputs.version }}
       image-uri: ${{ steps.build.outputs.image-uri }}
@@ -369,9 +366,6 @@ jobs:
       needs.test-migrations.result == 'success' &&
       github.event_name == 'push' &&
       github.ref == 'refs/heads/develop'
-    permissions:
-      id-token: write
-      contents: read
     environment:
       name: staging
 
@@ -556,9 +550,6 @@ jobs:
       needs.test-migrations.result == 'success' &&
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main'
-    permissions:
-      id-token: write
-      contents: read
     environment:
       name: production
       url: https://tripalta.com
