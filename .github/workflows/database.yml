@@ -221,15 +221,26 @@ jobs:
 
       - name: Run Flyway Migrations
         run: |
-          if [ -f "flyway.conf" ] || [ -f "flyway-local.conf" ]; then
-            npm run migrate:local || flyway -url=jdbc:postgresql://localhost:5432/${{ env.POSTGRES_DB }} -user=${{ env.POSTGRES_USER }} -password=${{ env.POSTGRES_PASSWORD }} -locations=filesystem:./migrations migrate
+          # Find migration locations (check for TA-* release folders or flat structure)
+          if [ -d "migrations/TA-0.0.1" ]; then
+            LOCATIONS="filesystem:migrations/TA-0.0.1"
+          elif [ -d "migrations" ]; then
+            LOCATIONS="filesystem:migrations"
           else
-            echo "No Flyway configuration found, skipping migrations"
+            echo "No migrations folder found, skipping"
+            exit 0
           fi
-        env:
-          FLYWAY_URL: jdbc:postgresql://localhost:5432/${{ env.POSTGRES_DB }}
-          FLYWAY_USER: ${{ env.POSTGRES_USER }}
-          FLYWAY_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+
+          # Run Flyway directly with CI test database
+          # baselineVersion=1 skips V0 (setup scripts with psql commands)
+          flyway \
+            -url=jdbc:postgresql://localhost:5432/${{ env.POSTGRES_DB }} \
+            -user=${{ env.POSTGRES_USER }} \
+            -password=${{ env.POSTGRES_PASSWORD }} \
+            -locations=$LOCATIONS \
+            -baselineOnMigrate=true \
+            -baselineVersion=1 \
+            migrate
 
       - name: Verify Database Schema
         run: |
