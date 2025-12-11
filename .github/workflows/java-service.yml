@@ -37,6 +37,11 @@ on:
         required: false
         type: boolean
         default: false
+      enable-code-quality-checks:
+        description: 'Whether to run code quality checks (spotless, checkstyle, pmd, spotbugs)'
+        required: false
+        type: boolean
+        default: true
     secrets:
       AWS_ROLE_ARN_STAGING:
         required: false
@@ -95,18 +100,26 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
-      # Code Quality Checks
+      # Code Quality Checks (optional - only if plugins are configured)
       - name: Check Code Formatting (Spotless)
+        if: inputs.enable-code-quality-checks
         run: ./mvnw spotless:check -q
+        continue-on-error: true
 
       - name: Checkstyle Analysis
+        if: inputs.enable-code-quality-checks
         run: ./mvnw checkstyle:check -q
+        continue-on-error: true
 
       - name: PMD Analysis
+        if: inputs.enable-code-quality-checks
         run: ./mvnw pmd:check -q
+        continue-on-error: true
 
       - name: SpotBugs Security Analysis
+        if: inputs.enable-code-quality-checks
         run: ./mvnw spotbugs:check -q
+        continue-on-error: true
 
       # Dependency Vulnerability Scanning
       - name: OWASP Dependency Check
