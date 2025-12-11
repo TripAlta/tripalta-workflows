@@ -12,6 +12,21 @@ on:
         required: false
         type: string
         default: '3.12'
+      run-integration-tests:
+        description: 'Whether to run integration tests'
+        required: false
+        type: boolean
+        default: true
+      db-name:
+        description: 'Database name for tests'
+        required: false
+        type: string
+        default: 'test_db'
+      service-port:
+        description: 'Service port for health checks'
+        required: false
+        type: string
+        default: '8083'
       enable-slack-notifications:
         description: 'Whether to send Slack notifications'
         required: false
@@ -38,23 +53,33 @@ concurrency:
 env:
   POSTGRES_USER: test_user
   POSTGRES_PASSWORD: test_password
-  POSTGRES_DB: ai_db
 
 jobs:
   build-and-test:
     name: Build & Test
     runs-on: ubuntu-latest
+    env:
+      POSTGRES_DB: ${{ inputs.db-name }}
     services:
       postgres:
         image: postgres:17
         env:
-          POSTGRES_USER: ${{ env.POSTGRES_USER }}
-          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
-          POSTGRES_DB: ${{ env.POSTGRES_DB }}
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: ${{ inputs.db-name }}
         ports:
           - 5432:5432
         options: >-
           --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -269,7 +294,7 @@ jobs:
         run: |
           echo "Running smoke test for ${{ inputs.service-name }}"
           sleep 10
-          HEALTH_URL="http://${{ inputs.service-name }}.tripalta.internal:8083/health"
+          HEALTH_URL="http://${{ inputs.service-name }}.tripalta.internal:${{ inputs.service-port }}/health"
           for i in {1..5}; do
             if curl -sf --max-time 10 "$HEALTH_URL" > /dev/null 2>&1; then
               echo "Smoke test passed on attempt $i"
@@ -418,7 +443,7 @@ jobs:
         run: |
           echo "Running production smoke test for ${{ inputs.service-name }}"
           sleep 10
-          HEALTH_URL="http://${{ inputs.service-name }}.tripalta.internal:8083/health"
+          HEALTH_URL="http://${{ inputs.service-name }}.tripalta.internal:${{ inputs.service-port }}/health"
           for i in {1..5}; do
             if curl -sf --max-time 10 "$HEALTH_URL" > /dev/null 2>&1; then
               echo "Smoke test passed on attempt $i"

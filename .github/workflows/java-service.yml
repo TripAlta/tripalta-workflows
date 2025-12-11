@@ -17,6 +17,16 @@ on:
         required: false
         type: boolean
         default: true
+      db-name:
+        description: 'Database name for tests'
+        required: false
+        type: string
+        default: 'test_db'
+      service-port:
+        description: 'Service port for health checks'
+        required: false
+        type: string
+        default: '8080'
       enable-slack-notifications:
         description: 'Whether to send Slack notifications'
         required: false
@@ -47,14 +57,14 @@ jobs:
     env:
       POSTGRES_USER: test_user
       POSTGRES_PASSWORD: test_password
-      POSTGRES_DB: test_db
+      POSTGRES_DB: ${{ inputs.db-name }}
     services:
       postgres:
         image: postgres:17
         env:
           POSTGRES_USER: test_user
           POSTGRES_PASSWORD: test_password
-          POSTGRES_DB: test_db
+          POSTGRES_DB: ${{ inputs.db-name }}
         ports:
           - 5432:5432
         options: >-
@@ -295,7 +305,7 @@ jobs:
           # Wait a bit for service to be fully ready
           sleep 10
           # Get the service endpoint from AWS or use internal naming
-          HEALTH_URL="http://${{ inputs.service-name }}-staging.tripalta.internal:8080/actuator/health"
+          HEALTH_URL="http://${{ inputs.service-name }}-staging.tripalta.internal:${{ inputs.service-port }}/actuator/health"
           # Retry health check up to 5 times
           for i in {1..5}; do
             if curl -sf --max-time 10 "$HEALTH_URL" > /dev/null 2>&1; then
@@ -498,7 +508,7 @@ jobs:
         run: |
           echo "Running production smoke test for ${{ inputs.service-name }}"
           sleep 10
-          HEALTH_URL="http://${{ inputs.service-name }}.tripalta.internal:8080/actuator/health"
+          HEALTH_URL="http://${{ inputs.service-name }}.tripalta.internal:${{ inputs.service-port }}/actuator/health"
           for i in {1..5}; do
             if curl -sf --max-time 10 "$HEALTH_URL" > /dev/null 2>&1; then
               echo "Smoke test passed on attempt $i"
