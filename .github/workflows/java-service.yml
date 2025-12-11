@@ -155,14 +155,22 @@ jobs:
           path: target/dependency-check-report.*
           retention-days: 30
 
-      # Generate Test Summary
+      # Generate Test Summary (temporarily inline to avoid cross-repo action reference issues)
       - name: Generate Test Summary
         if: always()
-        uses: tripalta/tripalta-workflows/actions/test-summary@main
-        with:
-          test-results-path: target/surefire-reports
-          coverage-path: target/site/jacoco/jacoco.xml
-          pass-threshold: '80'
+        shell: bash
+        run: |
+          echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
+          if [ -d "target/surefire-reports" ]; then
+            TESTS=$(find target/surefire-reports -name "*.xml" -exec grep -l "testsuite" {} \; | wc -l | tr -d ' ')
+            FAILURES=$(grep -r "failures=" target/surefire-reports/*.xml 2>/dev/null | grep -oP 'failures="\K\d+' | awk '{s+=$1} END {print s+0}')
+            ERRORS=$(grep -r "errors=" target/surefire-reports/*.xml 2>/dev/null | grep -oP 'errors="\K\d+' | awk '{s+=$1} END {print s+0}')
+            echo "- Test files: $TESTS" >> $GITHUB_STEP_SUMMARY
+            echo "- Failures: $FAILURES" >> $GITHUB_STEP_SUMMARY
+            echo "- Errors: $ERRORS" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No test results found" >> $GITHUB_STEP_SUMMARY
+          fi
 
       # Notify on build failure
       - name: Notify Slack on Build Failure
