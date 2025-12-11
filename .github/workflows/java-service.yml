@@ -40,22 +40,21 @@ concurrency:
   group: java-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  POSTGRES_USER: test_user
-  POSTGRES_PASSWORD: test_password
-  POSTGRES_DB: test_db
-
 jobs:
   build-and-test:
     name: Build & Test
     runs-on: ubuntu-latest
+    env:
+      POSTGRES_USER: test_user
+      POSTGRES_PASSWORD: test_password
+      POSTGRES_DB: test_db
     services:
       postgres:
         image: postgres:17
         env:
-          POSTGRES_USER: ${{ env.POSTGRES_USER }}
-          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
-          POSTGRES_DB: ${{ env.POSTGRES_DB }}
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: test_db
         ports:
           - 5432:5432
         options: >-
