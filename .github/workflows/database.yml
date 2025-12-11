@@ -232,14 +232,14 @@ jobs:
           fi
 
           # Run Flyway directly with CI test database
-          # baselineVersion=1 skips V0 (setup scripts with psql commands)
+          # baselineVersion=0 marks V0 as already applied, runs V1+
           flyway \
             -url=jdbc:postgresql://localhost:5432/${{ env.POSTGRES_DB }} \
             -user=${{ env.POSTGRES_USER }} \
             -password=${{ env.POSTGRES_PASSWORD }} \
             -locations=$LOCATIONS \
             -baselineOnMigrate=true \
-            -baselineVersion=1 \
+            -baselineVersion=0 \
             migrate
 
       - name: Verify Database Schema
