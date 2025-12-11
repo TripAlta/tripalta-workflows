@@ -81,7 +81,7 @@ jobs:
           fi
 
       - name: Security Scan (tfsec)
-        uses: aquasecurity/tfsec-action@v1.0.0
+        uses: aquasecurity/tfsec-action@v1.0.3
         with:
           working_directory: ${{ inputs.working-directory }}
           soft_fail: false
