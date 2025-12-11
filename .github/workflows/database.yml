@@ -273,9 +273,6 @@ jobs:
     name: Build & Push Migrator Image
     runs-on: ubuntu-latest
     needs: test-migrations
-    permissions:
-      id-token: write
-      contents: read
     if: |
       inputs.use-ecs-migration &&
       github.event_name == 'push' &&
@@ -364,9 +361,6 @@ jobs:
     name: Deploy to Staging
     runs-on: ubuntu-latest
     needs: [test-migrations, build-push-image]
-    permissions:
-      id-token: write
-      contents: read
     if: |
       always() &&
       needs.test-migrations.result == 'success' &&
@@ -551,9 +545,6 @@ jobs:
     name: Deploy to Production
     runs-on: ubuntu-latest
     needs: [test-migrations, build-push-image]
-    permissions:
-      id-token: write
-      contents: read
     if: |
       always() &&
       needs.test-migrations.result == 'success' &&
