@@ -292,7 +292,7 @@ jobs:
           sudo ln -s $(pwd)/flyway-${{ inputs.flyway-version }}/flyway /usr/local/bin/flyway
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
           role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
@@ -391,7 +391,7 @@ jobs:
           sudo ln -s $(pwd)/flyway-${{ inputs.flyway-version }}/flyway /usr/local/bin/flyway
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
           role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
