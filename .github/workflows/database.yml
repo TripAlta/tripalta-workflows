@@ -316,7 +316,7 @@ jobs:
           FLYWAY_PASSWORD: ${{ steps.get-rds-endpoint.outputs.rds_password }}
 
       - name: Notify Slack on Staging Success
-        if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        if: success() && inputs.enable-slack-notifications
         uses: slackapi/slack-github-action@v1.26.0
         with:
           payload: |
@@ -415,7 +415,7 @@ jobs:
           FLYWAY_PASSWORD: ${{ steps.get-rds-endpoint.outputs.rds_password }}
 
       - name: Notify Slack on Production Success
-        if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        if: success() && inputs.enable-slack-notifications
         uses: slackapi/slack-github-action@v1.26.0
         with:
           payload: |
@@ -436,7 +436,7 @@ jobs:
           SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
       - name: Notify Slack on Production Failure
-        if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        if: failure() && inputs.enable-slack-notifications
         uses: slackapi/slack-github-action@v1.26.0
         with:
           payload: |
