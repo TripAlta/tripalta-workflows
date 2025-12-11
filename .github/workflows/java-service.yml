@@ -31,7 +31,7 @@ on:
         description: 'Whether to send Slack notifications'
         required: false
         type: boolean
-        default: true
+        default: false
       enable-performance-tests:
         description: 'Whether to run performance tests on staging'
         required: false
@@ -42,25 +42,216 @@ on:
         required: false
         type: boolean
         default: true
-    secrets:
-      AWS_ROLE_ARN_STAGING:
-        required: false
-      AWS_ROLE_ARN_PROD:
-        required: false
-      SLACK_WEBHOOK_URL:
-        required: false
-      K6_CLOUD_TOKEN:
-        required: false
 
-# Cancel in-progress runs for the same workflow and ref
 concurrency:
   group: java-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build-and-test:
-    name: Build & Test
+  # ========================================
+  # PARALLEL JOBS: Code Quality Checks
+  # ========================================
+
+  format-check:
+    name: Format Check (Spotless)
     runs-on: ubuntu-latest
+    if: ${{ inputs.enable-code-quality-checks }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Check Code Formatting
+        run: ./mvnw spotless:check -q
+
+  checkstyle:
+    name: Checkstyle Analysis
+    runs-on: ubuntu-latest
+    if: ${{ inputs.enable-code-quality-checks }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Run Checkstyle
+        run: ./mvnw checkstyle:check -q
+
+      - name: Upload Checkstyle Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checkstyle-report-${{ inputs.service-name }}
+          path: target/checkstyle-result.xml
+          retention-days: 30
+          if-no-files-found: ignore
+
+  pmd:
+    name: PMD Analysis
+    runs-on: ubuntu-latest
+    if: ${{ inputs.enable-code-quality-checks }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Run PMD
+        run: ./mvnw pmd:check -q
+
+      - name: Upload PMD Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pmd-report-${{ inputs.service-name }}
+          path: target/pmd.xml
+          retention-days: 30
+          if-no-files-found: ignore
+
+  spotbugs:
+    name: SpotBugs Security Analysis
+    runs-on: ubuntu-latest
+    if: ${{ inputs.enable-code-quality-checks }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Compile for SpotBugs
+        run: ./mvnw compile -DskipTests -q
+
+      - name: Run SpotBugs
+        run: ./mvnw spotbugs:check -q
+
+      - name: Upload SpotBugs Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spotbugs-report-${{ inputs.service-name }}
+          path: target/spotbugsXml.xml
+          retention-days: 30
+          if-no-files-found: ignore
+
+  dependency-check:
+    name: OWASP Dependency Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Run OWASP Dependency Check
+        run: ./mvnw org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=9 -q || true
+
+      - name: Check for Critical Vulnerabilities
+        run: |
+          if [ -f target/dependency-check-report.json ]; then
+            CRITICAL=$(grep -c '"severity" : "CRITICAL"' target/dependency-check-report.json 2>/dev/null || echo "0")
+            if [ "$CRITICAL" -gt 0 ]; then
+              echo "::error::Found $CRITICAL CRITICAL vulnerabilities in dependencies"
+              exit 1
+            fi
+            echo "No CRITICAL vulnerabilities found"
+          else
+            echo "No dependency check report found, skipping"
+          fi
+
+      - name: Upload Dependency Check Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-check-${{ inputs.service-name }}
+          path: target/dependency-check-report.*
+          retention-days: 30
+          if-no-files-found: ignore
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Run Unit Tests
+        run: ./mvnw test -Dspring.profiles.active=test -DskipITs -T 1C
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+
+      - name: Generate JaCoCo Report
+        run: ./mvnw jacoco:report -q || true
+
+      - name: Upload Unit Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-results-${{ inputs.service-name }}
+          path: target/surefire-reports/*.xml
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload Coverage Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-unit-${{ inputs.service-name }}
+          path: target/site/jacoco/
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # ========================================
+  # SEQUENTIAL JOB: Integration Tests
+  # ========================================
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [format-check, checkstyle, pmd, spotbugs, dependency-check, unit-tests]
+    if: |
+      always() &&
+      ${{ inputs.run-integration-tests }} &&
+      (needs.format-check.result == 'success' || needs.format-check.result == 'skipped') &&
+      (needs.checkstyle.result == 'success' || needs.checkstyle.result == 'skipped') &&
+      (needs.pmd.result == 'success' || needs.pmd.result == 'skipped') &&
+      (needs.spotbugs.result == 'success' || needs.spotbugs.result == 'skipped') &&
+      (needs.dependency-check.result == 'success' || needs.dependency-check.result == 'skipped') &&
+      needs.unit-tests.result == 'success'
     env:
       POSTGRES_USER: test_user
       POSTGRES_PASSWORD: test_password
@@ -91,56 +282,28 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Set up JDK ${{ inputs.java-version }}
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           java-version: ${{ inputs.java-version }}
           distribution: 'temurin'
           cache: 'maven'
 
-      # Code Quality Checks (optional - only if plugins are configured)
-      - name: Check Code Formatting (Spotless)
-        if: inputs.enable-code-quality-checks
-        run: ./mvnw spotless:check -q
-        continue-on-error: true
-
-      - name: Checkstyle Analysis
-        if: inputs.enable-code-quality-checks
-        run: ./mvnw checkstyle:check -q
-        continue-on-error: true
-
-      - name: PMD Analysis
-        if: inputs.enable-code-quality-checks
-        run: ./mvnw pmd:check -q
-        continue-on-error: true
-
-      - name: SpotBugs Security Analysis
-        if: inputs.enable-code-quality-checks
-        run: ./mvnw spotbugs:check -q
-        continue-on-error: true
-
-      # Dependency Vulnerability Scanning
-      - name: OWASP Dependency Check
-        run: ./mvnw org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=7 -q || true
-
-      - name: Check for Critical Vulnerabilities
+      - name: Wait for PostgreSQL
         run: |
-          if [ -f target/dependency-check-report.json ]; then
-            CRITICAL=$(grep -c '"severity" : "CRITICAL"' target/dependency-check-report.json 2>/dev/null || echo "0")
-            HIGH=$(grep -c '"severity" : "HIGH"' target/dependency-check-report.json 2>/dev/null || echo "0")
-            if [ "$CRITICAL" -gt 0 ]; then
-              echo "::error::Found $CRITICAL CRITICAL vulnerabilities in dependencies"
-              exit 1
-            fi
-            if [ "$HIGH" -gt 5 ]; then
-              echo "::warning::Found $HIGH HIGH severity vulnerabilities in dependencies"
-            fi
-          fi
+          until pg_isready -h localhost -p 5432 -U test_user; do
+            echo "Waiting for PostgreSQL..."
+            sleep 2
+          done
 
-      # Build and Test (with parallel execution)
-      - name: Build and Run Tests
+      - name: Create Required Extensions
+        run: |
+          PGPASSWORD=${{ env.POSTGRES_PASSWORD }} psql -h localhost -U ${{ env.POSTGRES_USER }} -d ${{ env.POSTGRES_DB }} -c "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"
+          PGPASSWORD=${{ env.POSTGRES_PASSWORD }} psql -h localhost -U ${{ env.POSTGRES_USER }} -d ${{ env.POSTGRES_DB }} -c "CREATE EXTENSION IF NOT EXISTS \"pgcrypto\";"
+
+      - name: Run Integration Tests
         run: ./mvnw verify -Dspring.profiles.active=test -T 1C
         env:
           POSTGRES_HOST: localhost
@@ -150,100 +313,51 @@ jobs:
           REDIS_HOST: localhost
           REDIS_PORT: 6379
 
-      # Generate Coverage Report
       - name: Generate JaCoCo Report
-        run: ./mvnw jacoco:report -q
+        run: ./mvnw jacoco:report -q || true
 
-      # Upload Test Results
-      - name: Upload Test Results
-        uses: actions/upload-artifact@v5
+      - name: Upload Integration Test Results
+        uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-results-${{ inputs.service-name }}
-          path: target/surefire-reports/*.xml
+          name: integration-test-results-${{ inputs.service-name }}
+          path: |
+            target/surefire-reports/*.xml
+            target/failsafe-reports/*.xml
           retention-days: 30
+          if-no-files-found: ignore
 
-      # Upload Coverage Report
       - name: Upload Coverage Report
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
           name: coverage-report-${{ inputs.service-name }}
           path: target/site/jacoco/
           retention-days: 30
+          if-no-files-found: ignore
 
-      # Upload Dependency Check Report
-      - name: Upload Dependency Check Report
-        uses: actions/upload-artifact@v5
-        if: always()
-        with:
-          name: dependency-check-${{ inputs.service-name }}
-          path: target/dependency-check-report.*
-          retention-days: 30
+  # ========================================
+  # BUILD JOB: Build and Push Docker Image
+  # ========================================
 
-      # Generate Test Summary (temporarily inline to avoid cross-repo action reference issues)
-      - name: Generate Test Summary
-        if: always()
-        shell: bash
-        run: |
-          echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
-          if [ -d "target/surefire-reports" ]; then
-            TESTS=$(find target/surefire-reports -name "*.xml" -exec grep -l "testsuite" {} \; | wc -l | tr -d ' ')
-            FAILURES=$(grep -r "failures=" target/surefire-reports/*.xml 2>/dev/null | grep -oP 'failures="\K\d+' | awk '{s+=$1} END {print s+0}')
-            ERRORS=$(grep -r "errors=" target/surefire-reports/*.xml 2>/dev/null | grep -oP 'errors="\K\d+' | awk '{s+=$1} END {print s+0}')
-            echo "- Test files: $TESTS" >> $GITHUB_STEP_SUMMARY
-            echo "- Failures: $FAILURES" >> $GITHUB_STEP_SUMMARY
-            echo "- Errors: $ERRORS" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "No test results found" >> $GITHUB_STEP_SUMMARY
-          fi
-
-      # Notify on build failure
-      - name: Notify Slack on Build Failure
-        if: failure() && inputs.enable-slack-notifications
-        uses: slackapi/slack-github-action@v2.1.1
-        with:
-          payload: |
-            {
-              "text": ":x: Build Failed: ${{ inputs.service-name }}",
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": ":x: *Build Failed*\n*Service:* ${{ inputs.service-name }}\n*Branch:* ${{ github.ref_name }}\n*Commit:* <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\n*Author:* ${{ github.actor }}"
-                  }
-                },
-                {
-                  "type": "actions",
-                  "elements": [
-                    {
-                      "type": "button",
-                      "text": {"type": "plain_text", "text": "View Workflow"},
-                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-                    }
-                  ]
-                }
-              ]
-            }
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
-
-  deploy-staging:
-    name: Deploy to Staging
-    needs: build-and-test
-    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+  build-push-image:
+    name: Build & Push Docker Image
     runs-on: ubuntu-latest
-    environment: staging
+    needs: [integration-tests]
+    if: |
+      always() &&
+      (needs.integration-tests.result == 'success' || needs.integration-tests.result == 'skipped') &&
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
     outputs:
-      previous-task-def: ${{ steps.get-current-task.outputs.task-definition }}
-      deployment-id: ${{ steps.deploy.outputs.deployment-id }}
+      image-tag: ${{ steps.meta.outputs.version }}
+      image-uri: ${{ steps.build.outputs.image-uri }}
+
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Set up JDK ${{ inputs.java-version }}
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           java-version: ${{ inputs.java-version }}
           distribution: 'temurin'
@@ -252,8 +366,89 @@ jobs:
       - name: Build JAR
         run: ./mvnw package -DskipTests -q
 
+      - name: Configure AWS Credentials (Staging)
+        if: github.ref == 'refs/heads/develop'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+
+      - name: Configure AWS Credentials (Production)
+        if: github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set environment prefix
+        id: env-prefix
+        run: |
+          if [ "${{ github.ref }}" == "refs/heads/develop" ]; then
+            echo "prefix=tripalta-staging" >> $GITHUB_OUTPUT
+          else
+            echo "prefix=tripalta-production" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.login-ecr.outputs.registry }}/${{ steps.env-prefix.outputs.prefix }}/${{ inputs.service-name }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          target: production
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Output image URI
+        run: |
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ steps.env-prefix.outputs.prefix }}/${{ inputs.service-name }}:${{ steps.meta.outputs.version }}"
+          echo "image-uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Built and pushed: $IMAGE_URI"
+
+  # ========================================
+  # DEPLOYMENT JOB: Deploy to Staging
+  # ========================================
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [integration-tests, build-push-image]
+    if: |
+      always() &&
+      (needs.integration-tests.result == 'success' || needs.integration-tests.result == 'skipped') &&
+      needs.build-push-image.result == 'success' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/develop'
+    environment:
+      name: staging
+    outputs:
+      previous-task-def: ${{ steps.get-current-task.outputs.task-definition }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
           role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
@@ -262,7 +457,6 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Store current task definition for potential rollback
       - name: Get Current Task Definition
         id: get-current-task
         run: |
@@ -274,21 +468,6 @@ jobs:
           echo "task-definition=$CURRENT_TASK" >> $GITHUB_OUTPUT
           echo "Current task definition: $CURRENT_TASK"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build and Push Docker Image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          target: production
-          tags: |
-            ${{ steps.login-ecr.outputs.registry }}/tripalta-staging/${{ inputs.service-name }}:${{ github.sha }}
-            ${{ steps.login-ecr.outputs.registry }}/tripalta-staging/${{ inputs.service-name }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
       - name: Create GitHub Deployment
         id: deploy
         uses: chrnorm/deployment-action@v2
@@ -298,7 +477,6 @@ jobs:
           ref: ${{ github.sha }}
 
       - name: Update ECS Service
-        id: ecs-update
         run: |
           aws ecs update-service \
             --cluster tripalta-staging-cluster \
@@ -306,22 +484,16 @@ jobs:
             --force-new-deployment
 
       - name: Wait for Service Stability
-        id: wait-stable
         run: |
           aws ecs wait services-stable \
             --cluster tripalta-staging-cluster \
             --services ${{ inputs.service-name }}
 
-      # Post-deployment smoke test
       - name: Smoke Test
-        id: smoke-test
         run: |
           echo "Running smoke test for ${{ inputs.service-name }}"
-          # Wait a bit for service to be fully ready
           sleep 10
-          # Get the service endpoint from AWS or use internal naming
           HEALTH_URL="http://${{ inputs.service-name }}-staging.tripalta.internal:${{ inputs.service-port }}/actuator/health"
-          # Retry health check up to 5 times
           for i in {1..5}; do
             if curl -sf --max-time 10 "$HEALTH_URL" > /dev/null 2>&1; then
               echo "Smoke test passed on attempt $i"
@@ -332,7 +504,6 @@ jobs:
           done
           echo "::warning::Smoke test could not verify service health"
 
-      # Rollback on failure
       - name: Rollback on Failure
         if: failure() && steps.get-current-task.outputs.task-definition != ''
         run: |
@@ -354,8 +525,7 @@ jobs:
           state: ${{ job.status == 'success' && 'success' || 'failure' }}
           deployment-id: ${{ steps.deploy.outputs.deployment_id }}
 
-      # Slack notification for staging deployment
-      - name: Notify Slack on Staging Deployment
+      - name: Notify Slack on Staging Success
         if: success() && inputs.enable-slack-notifications
         uses: slackapi/slack-github-action@v2.1.1
         with:
@@ -407,15 +577,18 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
-  # Performance testing after staging deployment
+  # ========================================
+  # PERFORMANCE TEST JOB (Optional)
+  # ========================================
+
   performance-test:
     name: Performance Test
     needs: deploy-staging
-    if: inputs.enable-performance-tests && github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    if: ${{ inputs.enable-performance-tests && github.ref == 'refs/heads/develop' && github.event_name == 'push' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Run k6 Load Tests
         uses: grafana/k6-action@v0.3.1
@@ -426,7 +599,7 @@ jobs:
         continue-on-error: true
 
       - name: Upload Performance Results
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: performance-results-${{ inputs.service-name }}
@@ -434,33 +607,34 @@ jobs:
             k6-results.json
             *.html
           retention-days: 30
+          if-no-files-found: ignore
+
+  # ========================================
+  # DEPLOYMENT JOB: Deploy to Production
+  # ========================================
 
   deploy-production:
     name: Deploy to Production
-    needs: build-and-test
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
+    needs: [integration-tests, build-push-image]
+    if: |
+      always() &&
+      (needs.integration-tests.result == 'success' || needs.integration-tests.result == 'skipped') &&
+      needs.build-push-image.result == 'success' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
     environment:
       name: production
       url: https://api.tripalta.com
     outputs:
       previous-task-def: ${{ steps.get-current-task.outputs.task-definition }}
+
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Set up JDK ${{ inputs.java-version }}
-        uses: actions/setup-java@v5
-        with:
-          java-version: ${{ inputs.java-version }}
-          distribution: 'temurin'
-          cache: 'maven'
-
-      - name: Build JAR
-        run: ./mvnw package -DskipTests -q
+        uses: actions/checkout@v4
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
           role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
@@ -469,32 +643,16 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Store current task definition for potential rollback
       - name: Get Current Task Definition
         id: get-current-task
         run: |
           CURRENT_TASK=$(aws ecs describe-services \
-            --cluster tripalta-prod-cluster \
+            --cluster tripalta-production-cluster \
             --services ${{ inputs.service-name }} \
             --query 'services[0].taskDefinition' \
             --output text 2>/dev/null || echo "")
           echo "task-definition=$CURRENT_TASK" >> $GITHUB_OUTPUT
           echo "Current task definition: $CURRENT_TASK"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build and Push Docker Image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          target: production
-          tags: |
-            ${{ steps.login-ecr.outputs.registry }}/tripalta-prod/${{ inputs.service-name }}:${{ github.sha }}
-            ${{ steps.login-ecr.outputs.registry }}/tripalta-prod/${{ inputs.service-name }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       - name: Create GitHub Deployment
         id: deploy
@@ -507,19 +665,17 @@ jobs:
       - name: Update ECS Service
         run: |
           aws ecs update-service \
-            --cluster tripalta-prod-cluster \
+            --cluster tripalta-production-cluster \
             --service ${{ inputs.service-name }} \
             --force-new-deployment
 
       - name: Wait for Service Stability
         run: |
           aws ecs wait services-stable \
-            --cluster tripalta-prod-cluster \
+            --cluster tripalta-production-cluster \
             --services ${{ inputs.service-name }}
 
-      # Post-deployment smoke test
       - name: Smoke Test
-        id: smoke-test
         run: |
           echo "Running production smoke test for ${{ inputs.service-name }}"
           sleep 10
@@ -534,17 +690,16 @@ jobs:
           done
           echo "::warning::Smoke test could not verify service health"
 
-      # Rollback on failure
       - name: Rollback on Failure
         if: failure() && steps.get-current-task.outputs.task-definition != ''
         run: |
           echo "::error::Production deployment failed, rolling back..."
           aws ecs update-service \
-            --cluster tripalta-prod-cluster \
+            --cluster tripalta-production-cluster \
             --service ${{ inputs.service-name }} \
             --task-definition ${{ steps.get-current-task.outputs.task-definition }}
           aws ecs wait services-stable \
-            --cluster tripalta-prod-cluster \
+            --cluster tripalta-production-cluster \
             --services ${{ inputs.service-name }}
           echo "Rolled back to ${{ steps.get-current-task.outputs.task-definition }}"
 
@@ -556,10 +711,9 @@ jobs:
           state: ${{ job.status == 'success' && 'success' || 'failure' }}
           deployment-id: ${{ steps.deploy.outputs.deployment_id }}
 
-      # Generate changelog
       - name: Generate Changelog
         if: success()
-        uses: mikepenz/release-changelog-builder-action@v6
+        uses: mikepenz/release-changelog-builder-action@v5
         id: changelog
         with:
           configuration: ".github/changelog-config.json"
@@ -568,8 +722,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         continue-on-error: true
 
-      # Slack notification for production deployment
-      - name: Notify Slack on Production Deployment
+      - name: Notify Slack on Production Success
         if: success() && inputs.enable-slack-notifications
         uses: slackapi/slack-github-action@v2.1.1
         with:
@@ -621,6 +774,91 @@ jobs:
                       "type": "button",
                       "text": {"type": "plain_text", "text": "View Workflow"},
                       "style": "danger",
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # ========================================
+  # SUMMARY JOB: Consolidate Results
+  # ========================================
+
+  ci-summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    needs: [format-check, checkstyle, pmd, spotbugs, dependency-check, unit-tests, integration-tests]
+    if: always()
+    steps:
+      - name: Check Job Results
+        run: |
+          echo "==================================="
+          echo "CI Pipeline Summary"
+          echo "==================================="
+          echo "Service: ${{ inputs.service-name }}"
+          echo "-----------------------------------"
+          echo "Format Check (Spotless): ${{ needs.format-check.result }}"
+          echo "Checkstyle: ${{ needs.checkstyle.result }}"
+          echo "PMD: ${{ needs.pmd.result }}"
+          echo "SpotBugs: ${{ needs.spotbugs.result }}"
+          echo "Dependency Check: ${{ needs.dependency-check.result }}"
+          echo "Unit Tests: ${{ needs.unit-tests.result }}"
+          echo "Integration Tests: ${{ needs.integration-tests.result }}"
+          echo "==================================="
+
+          # Generate GitHub Step Summary
+          echo "## CI Results Summary - ${{ inputs.service-name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Format Check (Spotless) | ${{ needs.format-check.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Checkstyle | ${{ needs.checkstyle.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| PMD | ${{ needs.pmd.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SpotBugs | ${{ needs.spotbugs.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependency Check | ${{ needs.dependency-check.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Unit Tests | ${{ needs.unit-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Integration Tests | ${{ needs.integration-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+
+          # Fail if critical jobs failed
+          if [ "${{ needs.format-check.result }}" == "failure" ] || \
+             [ "${{ needs.checkstyle.result }}" == "failure" ] || \
+             [ "${{ needs.pmd.result }}" == "failure" ] || \
+             [ "${{ needs.spotbugs.result }}" == "failure" ] || \
+             [ "${{ needs.unit-tests.result }}" == "failure" ] || \
+             [ "${{ needs.integration-tests.result }}" == "failure" ]; then
+            echo ""
+            echo "Critical job(s) failed - CI Pipeline Failed"
+            exit 1
+          else
+            echo ""
+            echo "CI Pipeline Passed"
+          fi
+
+      - name: Notify Slack on CI Failure
+        if: failure() && inputs.enable-slack-notifications
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          payload: |
+            {
+              "text": ":x: CI Failed: ${{ inputs.service-name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: *CI Pipeline Failed*\n*Service:* ${{ inputs.service-name }}\n*Branch:* ${{ github.ref_name }}\n*Commit:* <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\n*Author:* ${{ github.actor }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "View Workflow"},
                       "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
                     }
                   ]

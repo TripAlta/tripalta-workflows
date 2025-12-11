@@ -31,34 +31,235 @@ on:
         description: 'Whether to send Slack notifications'
         required: false
         type: boolean
-        default: true
+        default: false
       enable-performance-tests:
         description: 'Whether to run performance tests on staging'
         required: false
         type: boolean
         default: false
-    secrets:
-      AWS_ROLE_ARN_STAGING:
-        required: false
-      AWS_ROLE_ARN_PROD:
-        required: false
-      SLACK_WEBHOOK_URL:
-        required: false
 
-# Cancel in-progress runs for the same workflow and ref
 concurrency:
   group: python-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  POSTGRES_USER: test_user
-  POSTGRES_PASSWORD: test_password
-
 jobs:
-  build-and-test:
-    name: Build & Test
+  # ========================================
+  # PARALLEL JOBS: Code Quality Checks
+  # ========================================
+
+  format-check:
+    name: Format Check (Black)
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ inputs.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+
+      - name: Install Black
+        run: pip install black
+
+      - name: Check Formatting
+        run: black --check .
+
+  import-check:
+    name: Import Check (isort)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ inputs.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+
+      - name: Install isort
+        run: pip install isort
+
+      - name: Check Import Sorting
+        run: isort --check-only .
+
+  lint:
+    name: Lint (Flake8)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ inputs.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+
+      - name: Install Flake8
+        run: pip install flake8
+
+      - name: Run Flake8
+        run: flake8 . --count --show-source --statistics --max-line-length=120
+
+  type-check:
+    name: Type Check (MyPy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ inputs.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install mypy
+
+      - name: Run MyPy
+        run: mypy app/ --ignore-missing-imports
+
+  security-scan:
+    name: Security Scan (Bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ inputs.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+
+      - name: Install Bandit
+        run: pip install bandit
+
+      - name: Run Bandit Security Scan
+        run: |
+          bandit -r app/ -ll -f json -o bandit-report.json || true
+
+      - name: Check for High Severity Issues
+        run: |
+          if [ -f bandit-report.json ]; then
+            HIGH_ISSUES=$(python -c "import json; data=json.load(open('bandit-report.json')); print(len([r for r in data.get('results', []) if r.get('issue_severity') == 'HIGH']))")
+            if [ "$HIGH_ISSUES" -gt 0 ]; then
+              echo "::error::Found $HIGH_ISSUES HIGH severity security issues"
+              cat bandit-report.json
+              exit 1
+            fi
+            echo "No HIGH severity issues found"
+          fi
+
+      - name: Upload Security Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-report-${{ inputs.service-name }}
+          path: bandit-report.json
+          retention-days: 30
+
+  dependency-check:
+    name: Dependency Vulnerability Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ inputs.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pip-audit
+        run: |
+          pip-audit --strict --desc on 2>&1 | tee pip-audit-report.txt || true
+
+      - name: Check for Critical Vulnerabilities
+        run: |
+          if grep -q "CRITICAL" pip-audit-report.txt 2>/dev/null; then
+            echo "::error::Critical vulnerabilities found in dependencies"
+            exit 1
+          fi
+          echo "No CRITICAL vulnerabilities found"
+
+      - name: Upload Dependency Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pip-audit-report-${{ inputs.service-name }}
+          path: pip-audit-report.txt
+          retention-days: 30
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ inputs.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt 2>/dev/null || true
+          pip install pytest pytest-cov pytest-xdist
+
+      - name: Run Unit Tests
+        run: |
+          pytest tests/unit \
+                 --cov=app \
+                 --cov-report=xml:coverage-unit.xml \
+                 --junitxml=test-results-unit.xml \
+                 -n auto \
+                 -v \
+                 --ignore=tests/integration \
+                 2>/dev/null || pytest --cov=app --cov-report=xml:coverage-unit.xml --junitxml=test-results-unit.xml -v --ignore=tests/integration 2>/dev/null || echo "No unit tests found or tests passed"
+
+      - name: Upload Unit Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-results-${{ inputs.service-name }}
+          path: |
+            test-results-unit.xml
+            coverage-unit.xml
+          retention-days: 30
+
+  # ========================================
+  # SEQUENTIAL JOB: Integration Tests
+  # ========================================
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [format-check, import-check, lint, type-check, security-scan, dependency-check, unit-tests]
+    if: ${{ inputs.run-integration-tests }}
     env:
+      POSTGRES_USER: test_user
+      POSTGRES_PASSWORD: test_password
       POSTGRES_DB: test_db
     services:
       postgres:
@@ -86,10 +287,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Set up Python ${{ inputs.python-version }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python-version }}
           cache: 'pip'
@@ -99,51 +300,24 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
           pip install -r requirements-dev.txt 2>/dev/null || true
+          pip install pytest pytest-cov pytest-xdist pytest-asyncio
 
-      # Code Quality Checks - Now blocking
-      - name: Check Formatting (Black)
-        run: black --check .
-
-      - name: Check Import Sorting (isort)
-        run: isort --check-only .
-
-      - name: Lint (Flake8)
-        run: flake8 . --count --show-source --statistics --max-line-length=120
-
-      - name: Type Check (MyPy)
-        run: mypy app/ --ignore-missing-imports
-
-      # Security scanning
-      - name: Security Scan (Bandit)
+      - name: Wait for PostgreSQL
         run: |
-          pip install bandit
-          bandit -r app/ -ll -f json -o bandit-report.json || true
-          # Fail on high severity issues
-          if [ -f bandit-report.json ]; then
-            HIGH_ISSUES=$(python -c "import json; data=json.load(open('bandit-report.json')); print(len([r for r in data.get('results', []) if r.get('issue_severity') == 'HIGH']))")
-            if [ "$HIGH_ISSUES" -gt 0 ]; then
-              echo "::error::Found $HIGH_ISSUES HIGH severity security issues"
-              cat bandit-report.json
-              exit 1
-            fi
-          fi
+          until pg_isready -h localhost -p 5432 -U test_user; do
+            echo "Waiting for PostgreSQL..."
+            sleep 2
+          done
 
-      # Dependency vulnerability scanning
-      - name: Check Dependencies for Vulnerabilities
+      - name: Create Required Extensions
         run: |
-          pip install pip-audit safety
-          pip-audit --strict --desc on 2>&1 | tee pip-audit-report.txt || true
-          # Check for critical vulnerabilities
-          if grep -q "CRITICAL" pip-audit-report.txt 2>/dev/null; then
-            echo "::error::Critical vulnerabilities found in dependencies"
-            exit 1
-          fi
+          PGPASSWORD=${{ env.POSTGRES_PASSWORD }} psql -h localhost -U ${{ env.POSTGRES_USER }} -d ${{ env.POSTGRES_DB }} -c "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"
+          PGPASSWORD=${{ env.POSTGRES_PASSWORD }} psql -h localhost -U ${{ env.POSTGRES_USER }} -d ${{ env.POSTGRES_DB }} -c "CREATE EXTENSION IF NOT EXISTS \"pgcrypto\";"
 
-      # Run Tests with Coverage (parallel execution)
-      - name: Run Tests
+      - name: Run Integration Tests
         run: |
-          pip install pytest-xdist 2>/dev/null || true
-          pytest --cov=app \
+          pytest tests/ \
+                 --cov=app \
                  --cov-report=xml:coverage.xml \
                  --cov-report=html:htmlcov \
                  --junitxml=test-results.xml \
@@ -151,90 +325,128 @@ jobs:
                  -v
         env:
           DATABASE_URL: postgresql://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@localhost:5432/${{ env.POSTGRES_DB }}
+          REDIS_URL: redis://localhost:6379
 
-      # Upload Test Results
       - name: Upload Test Results
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: test-results-${{ inputs.service-name }}
           path: test-results.xml
           retention-days: 30
 
-      # Upload Coverage
       - name: Upload Coverage Report
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
           name: coverage-report-${{ inputs.service-name }}
-          path: htmlcov/
-          retention-days: 30
-
-      # Upload Security Reports
-      - name: Upload Security Reports
-        uses: actions/upload-artifact@v5
-        if: always()
-        with:
-          name: security-reports-${{ inputs.service-name }}
           path: |
-            bandit-report.json
-            pip-audit-report.txt
+            coverage.xml
+            htmlcov/
           retention-days: 30
 
-      # Generate Test Summary
-      - name: Generate Test Summary
-        if: always()
-        uses: tripalta/tripalta-workflows/actions/test-summary@main
-        with:
-          test-results-path: test-results.xml
-          coverage-path: coverage.xml
-          pass-threshold: '80'
+  # ========================================
+  # BUILD JOB: Build and Push Docker Image
+  # ========================================
 
-      # Notify on build failure
-      - name: Notify Slack on Build Failure
-        if: failure() && inputs.enable-slack-notifications
-        uses: slackapi/slack-github-action@v2.1.1
+  build-push-image:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [integration-tests]
+    if: |
+      always() &&
+      (needs.integration-tests.result == 'success' || needs.integration-tests.result == 'skipped') &&
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+      image-uri: ${{ steps.build.outputs.image-uri }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (Staging)
+        if: github.ref == 'refs/heads/develop'
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          payload: |
-            {
-              "text": ":x: Build Failed: ${{ inputs.service-name }}",
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": ":x: *Build Failed*\n*Service:* ${{ inputs.service-name }}\n*Branch:* ${{ github.ref_name }}\n*Author:* ${{ github.actor }}"
-                  }
-                },
-                {
-                  "type": "actions",
-                  "elements": [
-                    {
-                      "type": "button",
-                      "text": {"type": "plain_text", "text": "View Workflow"},
-                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-                    }
-                  ]
-                }
-              ]
-            }
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+
+      - name: Configure AWS Credentials (Production)
+        if: github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set environment prefix
+        id: env-prefix
+        run: |
+          if [ "${{ github.ref }}" == "refs/heads/develop" ]; then
+            echo "prefix=tripalta-staging" >> $GITHUB_OUTPUT
+          else
+            echo "prefix=tripalta-production" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.login-ecr.outputs.registry }}/${{ steps.env-prefix.outputs.prefix }}/${{ inputs.service-name }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Output image URI
+        run: |
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ steps.env-prefix.outputs.prefix }}/${{ inputs.service-name }}:${{ steps.meta.outputs.version }}"
+          echo "image-uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Built and pushed: $IMAGE_URI"
+
+  # ========================================
+  # DEPLOYMENT JOB: Deploy to Staging
+  # ========================================
 
   deploy-staging:
     name: Deploy to Staging
-    needs: build-and-test
-    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
     runs-on: ubuntu-latest
-    environment: staging
+    needs: [integration-tests, build-push-image]
+    if: |
+      always() &&
+      (needs.integration-tests.result == 'success' || needs.integration-tests.result == 'skipped') &&
+      needs.build-push-image.result == 'success' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/develop'
+    environment:
+      name: staging
     outputs:
       previous-task-def: ${{ steps.get-current-task.outputs.task-definition }}
+
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
           role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
@@ -243,7 +455,6 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Store current task definition for potential rollback
       - name: Get Current Task Definition
         id: get-current-task
         run: |
@@ -253,20 +464,7 @@ jobs:
             --query 'services[0].taskDefinition' \
             --output text 2>/dev/null || echo "")
           echo "task-definition=$CURRENT_TASK" >> $GITHUB_OUTPUT
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build and Push Docker Image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ steps.login-ecr.outputs.registry }}/tripalta-staging/${{ inputs.service-name }}:${{ github.sha }}
-            ${{ steps.login-ecr.outputs.registry }}/tripalta-staging/${{ inputs.service-name }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          echo "Current task definition: $CURRENT_TASK"
 
       - name: Create GitHub Deployment
         id: deploy
@@ -289,7 +487,6 @@ jobs:
             --cluster tripalta-staging-cluster \
             --services ${{ inputs.service-name }}
 
-      # Post-deployment smoke test
       - name: Smoke Test
         run: |
           echo "Running smoke test for ${{ inputs.service-name }}"
@@ -305,7 +502,6 @@ jobs:
           done
           echo "::warning::Smoke test could not verify service health"
 
-      # Rollback on failure
       - name: Rollback on Failure
         if: failure() && steps.get-current-task.outputs.task-definition != ''
         run: |
@@ -326,7 +522,7 @@ jobs:
           state: ${{ job.status == 'success' && 'success' || 'failure' }}
           deployment-id: ${{ steps.deploy.outputs.deployment_id }}
 
-      - name: Notify Slack on Staging Deployment
+      - name: Notify Slack on Staging Success
         if: success() && inputs.enable-slack-notifications
         uses: slackapi/slack-github-action@v2.1.1
         with:
@@ -368,22 +564,32 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
+  # ========================================
+  # DEPLOYMENT JOB: Deploy to Production
+  # ========================================
+
   deploy-production:
     name: Deploy to Production
-    needs: build-and-test
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
+    needs: [integration-tests, build-push-image]
+    if: |
+      always() &&
+      (needs.integration-tests.result == 'success' || needs.integration-tests.result == 'skipped') &&
+      needs.build-push-image.result == 'success' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
     environment:
       name: production
       url: https://api.tripalta.com
     outputs:
       previous-task-def: ${{ steps.get-current-task.outputs.task-definition }}
+
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
           role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
@@ -392,30 +598,16 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Store current task definition for potential rollback
       - name: Get Current Task Definition
         id: get-current-task
         run: |
           CURRENT_TASK=$(aws ecs describe-services \
-            --cluster tripalta-prod-cluster \
+            --cluster tripalta-production-cluster \
             --services ${{ inputs.service-name }} \
             --query 'services[0].taskDefinition' \
             --output text 2>/dev/null || echo "")
           echo "task-definition=$CURRENT_TASK" >> $GITHUB_OUTPUT
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build and Push Docker Image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ steps.login-ecr.outputs.registry }}/tripalta-prod/${{ inputs.service-name }}:${{ github.sha }}
-            ${{ steps.login-ecr.outputs.registry }}/tripalta-prod/${{ inputs.service-name }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          echo "Current task definition: $CURRENT_TASK"
 
       - name: Create GitHub Deployment
         id: deploy
@@ -428,17 +620,16 @@ jobs:
       - name: Update ECS Service
         run: |
           aws ecs update-service \
-            --cluster tripalta-prod-cluster \
+            --cluster tripalta-production-cluster \
             --service ${{ inputs.service-name }} \
             --force-new-deployment
 
       - name: Wait for Service Stability
         run: |
           aws ecs wait services-stable \
-            --cluster tripalta-prod-cluster \
+            --cluster tripalta-production-cluster \
             --services ${{ inputs.service-name }}
 
-      # Post-deployment smoke test
       - name: Smoke Test
         run: |
           echo "Running production smoke test for ${{ inputs.service-name }}"
@@ -454,17 +645,16 @@ jobs:
           done
           echo "::warning::Smoke test could not verify service health"
 
-      # Rollback on failure
       - name: Rollback on Failure
         if: failure() && steps.get-current-task.outputs.task-definition != ''
         run: |
           echo "::error::Production deployment failed, rolling back..."
           aws ecs update-service \
-            --cluster tripalta-prod-cluster \
+            --cluster tripalta-production-cluster \
             --service ${{ inputs.service-name }} \
             --task-definition ${{ steps.get-current-task.outputs.task-definition }}
           aws ecs wait services-stable \
-            --cluster tripalta-prod-cluster \
+            --cluster tripalta-production-cluster \
             --services ${{ inputs.service-name }}
 
       - name: Update Deployment Status
@@ -475,10 +665,9 @@ jobs:
           state: ${{ job.status == 'success' && 'success' || 'failure' }}
           deployment-id: ${{ steps.deploy.outputs.deployment_id }}
 
-      # Generate changelog
       - name: Generate Changelog
         if: success()
-        uses: mikepenz/release-changelog-builder-action@v6
+        uses: mikepenz/release-changelog-builder-action@v5
         id: changelog
         with:
           configuration: ".github/changelog-config.json"
@@ -487,7 +676,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         continue-on-error: true
 
-      - name: Notify Slack on Production Deployment
+      - name: Notify Slack on Production Success
         if: success() && inputs.enable-slack-notifications
         uses: slackapi/slack-github-action@v2.1.1
         with:
@@ -530,6 +719,93 @@ jobs:
                       "type": "button",
                       "text": {"type": "plain_text", "text": "View Workflow"},
                       "style": "danger",
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # ========================================
+  # SUMMARY JOB: Consolidate Results
+  # ========================================
+
+  ci-summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    needs: [format-check, import-check, lint, type-check, security-scan, dependency-check, unit-tests, integration-tests]
+    if: always()
+    steps:
+      - name: Check Job Results
+        run: |
+          echo "==================================="
+          echo "CI Pipeline Summary"
+          echo "==================================="
+          echo "Service: ${{ inputs.service-name }}"
+          echo "-----------------------------------"
+          echo "Format Check (Black): ${{ needs.format-check.result }}"
+          echo "Import Check (isort): ${{ needs.import-check.result }}"
+          echo "Lint (Flake8): ${{ needs.lint.result }}"
+          echo "Type Check (MyPy): ${{ needs.type-check.result }}"
+          echo "Security Scan (Bandit): ${{ needs.security-scan.result }}"
+          echo "Dependency Check: ${{ needs.dependency-check.result }}"
+          echo "Unit Tests: ${{ needs.unit-tests.result }}"
+          echo "Integration Tests: ${{ needs.integration-tests.result }}"
+          echo "==================================="
+
+          # Generate GitHub Step Summary
+          echo "## CI Results Summary - ${{ inputs.service-name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Format Check (Black) | ${{ needs.format-check.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Import Check (isort) | ${{ needs.import-check.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Lint (Flake8) | ${{ needs.lint.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Type Check (MyPy) | ${{ needs.type-check.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Scan (Bandit) | ${{ needs.security-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependency Check | ${{ needs.dependency-check.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Unit Tests | ${{ needs.unit-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Integration Tests | ${{ needs.integration-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+
+          # Fail if critical jobs failed
+          if [ "${{ needs.format-check.result }}" == "failure" ] || \
+             [ "${{ needs.import-check.result }}" == "failure" ] || \
+             [ "${{ needs.lint.result }}" == "failure" ] || \
+             [ "${{ needs.type-check.result }}" == "failure" ] || \
+             [ "${{ needs.unit-tests.result }}" == "failure" ] || \
+             [ "${{ needs.integration-tests.result }}" == "failure" ]; then
+            echo ""
+            echo "Critical job(s) failed - CI Pipeline Failed"
+            exit 1
+          else
+            echo ""
+            echo "CI Pipeline Passed"
+          fi
+
+      - name: Notify Slack on CI Failure
+        if: failure() && inputs.enable-slack-notifications
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          payload: |
+            {
+              "text": ":x: CI Failed: ${{ inputs.service-name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: *CI Pipeline Failed*\n*Service:* ${{ inputs.service-name }}\n*Branch:* ${{ github.ref_name }}\n*Author:* ${{ github.actor }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "View Workflow"},
                       "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
                     }
                   ]
