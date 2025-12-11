@@ -609,7 +609,7 @@ jobs:
       # Generate changelog
       - name: Generate Changelog
         if: success()
-        uses: mikepenz/release-changelog-builder-action@v4
+        uses: mikepenz/release-changelog-builder-action@v6
         id: changelog
         with:
           configuration: ".github/changelog-config.json"
