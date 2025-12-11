@@ -44,11 +44,6 @@ concurrency:
   group: database-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  POSTGRES_USER: test_user
-  POSTGRES_PASSWORD: test_password
-  POSTGRES_DB: test_db
-
 jobs:
   # ========================================
   # PARALLEL JOBS: Linting & Validation
@@ -182,6 +177,10 @@ jobs:
     name: Test Migrations
     runs-on: ubuntu-latest
     needs: [lint-sql, validate-syntax, validate-schema, security, unit-tests]
+    env:
+      POSTGRES_USER: test_user
+      POSTGRES_PASSWORD: test_password
+      POSTGRES_DB: test_db
     services:
       postgres:
         image: postgres:${{ inputs.postgres-version }}
