@@ -32,19 +32,6 @@ on:
         required: false
         type: boolean
         default: true
-    secrets:
-      AWS_ROLE_ARN_STAGING:
-        required: false
-      AWS_ROLE_ARN_PROD:
-        required: false
-      CLOUDFRONT_STAGING_ID:
-        required: false
-      CLOUDFRONT_PROD_ID:
-        required: false
-      SLACK_WEBHOOK_URL:
-        required: false
-      AWS_ROLE_ARN_PREVIEW:
-        required: false
 
 # Cancel in-progress runs for the same workflow and ref
 concurrency:
