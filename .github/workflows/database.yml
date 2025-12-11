@@ -17,11 +17,23 @@ on:
         required: false
         type: string
         default: '20'
+      enable-slack-notifications:
+        description: 'Whether to send Slack notifications'
+        required: false
+        type: boolean
+        default: true
     secrets:
       AWS_ROLE_ARN_STAGING:
         required: false
       AWS_ROLE_ARN_PROD:
         required: false
+      SLACK_WEBHOOK_URL:
+        required: false
+
+# Cancel in-progress runs for the same workflow and ref
+concurrency:
+  group: database-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   POSTGRES_USER: test_user
@@ -60,25 +72,30 @@ jobs:
       - name: Install Dependencies
         run: npm ci
 
-      # SQL Linting
+      # SQL Linting - Now blocking
       - name: SQL Lint (SQLFluff)
-        run: npm run lint:sql || true
+        run: npm run lint:sql
 
-      # Syntax Validation
+      # Syntax Validation - Now blocking
       - name: Validate Migration Syntax
-        run: npm run validate:syntax || true
+        run: npm run validate:syntax
 
-      # Schema Validation
+      # Schema Validation - Now blocking
       - name: Validate Schema
-        run: npm run validate:schema || true
+        run: npm run validate:schema
 
-      # Security Checks
+      # Security Checks - Now blocking for critical issues
       - name: Security Validation
-        run: npm run validate:security || true
+        run: |
+          npm run validate:security 2>&1 | tee security-validation.txt
+          if grep -qi "CRITICAL\|SQL_INJECTION\|DROP TABLE\|DROP DATABASE" security-validation.txt 2>/dev/null; then
+            echo "::error::Critical security issue found in migrations"
+            exit 1
+          fi
 
       # Test Migration Application
       - name: Test Migrations
-        run: npm run validate:local || npm run migrate:local || true
+        run: npm run validate:local || npm run migrate:local
         env:
           FLYWAY_URL: jdbc:postgresql://localhost:5432/${{ env.POSTGRES_DB }}
           FLYWAY_USER: ${{ env.POSTGRES_USER }}
@@ -104,7 +121,16 @@ jobs:
           path: |
             test-results/
             junit.xml
-          retention-days: 7
+          retention-days: 30
+
+      # Upload Security Validation
+      - name: Upload Security Validation
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-validation-${{ inputs.db-name }}
+          path: security-validation.txt
+          retention-days: 30
 
       # Generate Test Summary
       - name: Generate Test Summary
@@ -113,6 +139,28 @@ jobs:
         with:
           test-results-path: test-results
           pass-threshold: '80'
+
+      # Notify on validation failure
+      - name: Notify Slack on Validation Failure
+        if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":x: Database Validation Failed: ${{ inputs.db-name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: *Database Validation Failed*\n*Database:* ${{ inputs.db-name }}\n*Branch:* ${{ github.ref_name }}\n*Author:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
   deploy-staging:
     name: Deploy to Staging
@@ -149,12 +197,56 @@ jobs:
       - name: Run Migrations on Staging
         run: npm run migrate:staging || npm run migrate || echo "Migration command not found"
 
+      - name: Notify Slack on Staging Migration
+        if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":database: Database Migrated: ${{ inputs.db-name }} (Staging)",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":database: *Database Migrated*\n*Database:* ${{ inputs.db-name }}\n*Environment:* Staging\n*Author:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Notify Slack on Staging Migration Failure
+        if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":warning: Database Migration Failed: ${{ inputs.db-name }} (Staging)",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":warning: *Database Migration Failed*\n*Database:* ${{ inputs.db-name }}\n*Environment:* Staging"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
   deploy-production:
     name: Deploy to Production
     needs: validate-and-test
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
-    environment: production
+    environment:
+      name: production
+      url: https://tripalta.com
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -183,3 +275,56 @@ jobs:
 
       - name: Run Migrations on Production
         run: npm run migrate:production || npm run migrate || echo "Migration command not found"
+
+      - name: Notify Slack on Production Migration
+        if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":white_check_mark: Database Migrated: ${{ inputs.db-name }} (Production)",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: *Database Migrated*\n*Database:* ${{ inputs.db-name }}\n*Environment:* Production\n*Author:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Notify Slack on Production Migration Failure
+        if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":rotating_light: PRODUCTION Database Migration Failed: ${{ inputs.db-name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":rotating_light: *PRODUCTION Database Migration Failed*\n*Database:* ${{ inputs.db-name }}\n*Author:* ${{ github.actor }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "View Workflow"},
+                      "style": "danger",
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

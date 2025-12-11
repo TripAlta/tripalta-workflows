@@ -13,11 +13,23 @@ on:
         required: false
         type: string
         default: '.'
+      enable-slack-notifications:
+        description: 'Whether to send Slack notifications'
+        required: false
+        type: boolean
+        default: true
     secrets:
       AWS_ROLE_ARN_STAGING:
         required: false
       AWS_ROLE_ARN_PROD:
         required: false
+      SLACK_WEBHOOK_URL:
+        required: false
+
+# Cancel in-progress runs for the same workflow and ref
+concurrency:
+  group: terraform-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   validate:
@@ -49,14 +61,57 @@ jobs:
           directory: ${{ inputs.working-directory }}
           framework: terraform
           soft_fail: false
+          output_format: json
+          output_file_path: checkov-results.json
         continue-on-error: true
+
+      - name: Check for Critical Checkov Findings
+        run: |
+          if [ -f checkov-results.json ]; then
+            FAILED=$(jq '.results.failed_checks | length' checkov-results.json 2>/dev/null || echo "0")
+            if [ "$FAILED" -gt 0 ]; then
+              echo "::warning::Checkov found $FAILED failed security checks"
+              # Check for CRITICAL severity
+              CRITICAL=$(jq '[.results.failed_checks[] | select(.severity == "CRITICAL")] | length' checkov-results.json 2>/dev/null || echo "0")
+              if [ "$CRITICAL" -gt 0 ]; then
+                echo "::error::Found $CRITICAL CRITICAL security issues"
+                exit 1
+              fi
+            fi
+          fi
 
       - name: Security Scan (tfsec)
         uses: aquasecurity/tfsec-action@v1.0.0
         with:
           working_directory: ${{ inputs.working-directory }}
           soft_fail: false
+          format: json
+          out: tfsec-results.json
         continue-on-error: true
+
+      - name: Check for Critical tfsec Findings
+        run: |
+          if [ -f tfsec-results.json ]; then
+            CRITICAL=$(jq '[.results[] | select(.severity == "CRITICAL")] | length' tfsec-results.json 2>/dev/null || echo "0")
+            HIGH=$(jq '[.results[] | select(.severity == "HIGH")] | length' tfsec-results.json 2>/dev/null || echo "0")
+            if [ "$CRITICAL" -gt 0 ]; then
+              echo "::error::Found $CRITICAL CRITICAL security issues in Terraform code"
+              exit 1
+            fi
+            if [ "$HIGH" -gt 5 ]; then
+              echo "::warning::Found $HIGH HIGH severity issues in Terraform code"
+            fi
+          fi
+
+      - name: Upload Security Scan Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-scan-results
+          path: |
+            checkov-results.json
+            tfsec-results.json
+          retention-days: 30
 
   plan-staging:
     name: Plan Staging
@@ -128,6 +183,58 @@ jobs:
         run: terraform apply -auto-approve tfplan
         working-directory: environments/staging
 
+      - name: Notify Slack on Staging Apply
+        if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":building_construction: Infrastructure Updated: Staging",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":building_construction: *Infrastructure Updated*\n*Environment:* Staging\n*Author:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Notify Slack on Staging Failure
+        if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":warning: Infrastructure Apply Failed: Staging",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":warning: *Infrastructure Apply Failed*\n*Environment:* Staging\n*Author:* ${{ github.actor }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "View Workflow"},
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
   plan-production:
     name: Plan Production
     needs: validate
@@ -168,7 +275,9 @@ jobs:
     name: Apply Production
     needs: plan-production
     runs-on: ubuntu-latest
-    environment: production
+    environment:
+      name: production
+      url: https://tripalta.com
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -197,3 +306,56 @@ jobs:
       - name: Terraform Apply
         run: terraform apply -auto-approve tfplan
         working-directory: environments/production
+
+      - name: Notify Slack on Production Apply
+        if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":white_check_mark: Infrastructure Updated: Production",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: *Infrastructure Updated*\n*Environment:* Production\n*Author:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Notify Slack on Production Failure
+        if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":rotating_light: PRODUCTION Infrastructure Apply Failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":rotating_light: *PRODUCTION Infrastructure Apply Failed*\n*Author:* ${{ github.actor }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "View Workflow"},
+                      "style": "danger",
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

@@ -12,11 +12,28 @@ on:
         required: false
         type: string
         default: '3.12'
+      enable-slack-notifications:
+        description: 'Whether to send Slack notifications'
+        required: false
+        type: boolean
+        default: true
+      enable-performance-tests:
+        description: 'Whether to run performance tests on staging'
+        required: false
+        type: boolean
+        default: false
     secrets:
       AWS_ROLE_ARN_STAGING:
         required: false
       AWS_ROLE_ARN_PROD:
         required: false
+      SLACK_WEBHOOK_URL:
+        required: false
+
+# Cancel in-progress runs for the same workflow and ref
+concurrency:
+  group: python-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   POSTGRES_USER: test_user
@@ -58,26 +75,54 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-dev.txt 2>/dev/null || true
 
-      # Code Quality Checks
+      # Code Quality Checks - Now blocking
       - name: Check Formatting (Black)
-        run: black --check . || true
+        run: black --check .
 
       - name: Check Import Sorting (isort)
-        run: isort --check-only . || true
+        run: isort --check-only .
 
       - name: Lint (Flake8)
-        run: flake8 . --count --show-source --statistics || true
+        run: flake8 . --count --show-source --statistics --max-line-length=120
 
       - name: Type Check (MyPy)
-        run: mypy app/ --ignore-missing-imports || true
+        run: mypy app/ --ignore-missing-imports
 
-      # Run Tests with Coverage
+      # Security scanning
+      - name: Security Scan (Bandit)
+        run: |
+          pip install bandit
+          bandit -r app/ -ll -f json -o bandit-report.json || true
+          # Fail on high severity issues
+          if [ -f bandit-report.json ]; then
+            HIGH_ISSUES=$(python -c "import json; data=json.load(open('bandit-report.json')); print(len([r for r in data.get('results', []) if r.get('issue_severity') == 'HIGH']))")
+            if [ "$HIGH_ISSUES" -gt 0 ]; then
+              echo "::error::Found $HIGH_ISSUES HIGH severity security issues"
+              cat bandit-report.json
+              exit 1
+            fi
+          fi
+
+      # Dependency vulnerability scanning
+      - name: Check Dependencies for Vulnerabilities
+        run: |
+          pip install pip-audit safety
+          pip-audit --strict --desc on 2>&1 | tee pip-audit-report.txt || true
+          # Check for critical vulnerabilities
+          if grep -q "CRITICAL" pip-audit-report.txt 2>/dev/null; then
+            echo "::error::Critical vulnerabilities found in dependencies"
+            exit 1
+          fi
+
+      # Run Tests with Coverage (parallel execution)
       - name: Run Tests
         run: |
+          pip install pytest-xdist 2>/dev/null || true
           pytest --cov=app \
                  --cov-report=xml:coverage.xml \
                  --cov-report=html:htmlcov \
                  --junitxml=test-results.xml \
+                 -n auto \
                  -v
         env:
           DATABASE_URL: postgresql://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@localhost:5432/${{ env.POSTGRES_DB }}
@@ -89,7 +134,7 @@ jobs:
         with:
           name: test-results-${{ inputs.service-name }}
           path: test-results.xml
-          retention-days: 7
+          retention-days: 30
 
       # Upload Coverage
       - name: Upload Coverage Report
@@ -97,7 +142,18 @@ jobs:
         with:
           name: coverage-report-${{ inputs.service-name }}
           path: htmlcov/
-          retention-days: 7
+          retention-days: 30
+
+      # Upload Security Reports
+      - name: Upload Security Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-reports-${{ inputs.service-name }}
+          path: |
+            bandit-report.json
+            pip-audit-report.txt
+          retention-days: 30
 
       # Generate Test Summary
       - name: Generate Test Summary
@@ -108,12 +164,46 @@ jobs:
           coverage-path: coverage.xml
           pass-threshold: '80'
 
+      # Notify on build failure
+      - name: Notify Slack on Build Failure
+        if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":x: Build Failed: ${{ inputs.service-name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: *Build Failed*\n*Service:* ${{ inputs.service-name }}\n*Branch:* ${{ github.ref_name }}\n*Author:* ${{ github.actor }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "View Workflow"},
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
   deploy-staging:
     name: Deploy to Staging
     needs: build-and-test
     if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: staging
+    outputs:
+      previous-task-def: ${{ steps.get-current-task.outputs.task-definition }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -128,16 +218,38 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and Push Docker Image
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: tripalta/${{ inputs.service-name }}
-          IMAGE_TAG: staging-${{ github.sha }}
+      # Store current task definition for potential rollback
+      - name: Get Current Task Definition
+        id: get-current-task
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:staging-latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:staging-latest
+          CURRENT_TASK=$(aws ecs describe-services \
+            --cluster tripalta-staging \
+            --services ${{ inputs.service-name }}-staging \
+            --query 'services[0].taskDefinition' \
+            --output text 2>/dev/null || echo "")
+          echo "task-definition=$CURRENT_TASK" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/tripalta/${{ inputs.service-name }}:staging-${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/tripalta/${{ inputs.service-name }}:staging-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create GitHub Deployment
+        id: deploy
+        uses: chrnorm/deployment-action@v2
+        with:
+          token: ${{ github.token }}
+          environment: staging
+          ref: ${{ github.sha }}
 
       - name: Update ECS Service
         run: |
@@ -152,12 +264,95 @@ jobs:
             --cluster tripalta-staging \
             --services ${{ inputs.service-name }}-staging
 
+      # Post-deployment smoke test
+      - name: Smoke Test
+        run: |
+          echo "Running smoke test for ${{ inputs.service-name }}"
+          sleep 10
+          HEALTH_URL="http://${{ inputs.service-name }}-staging.tripalta.internal:8083/health"
+          for i in {1..5}; do
+            if curl -sf --max-time 10 "$HEALTH_URL" > /dev/null 2>&1; then
+              echo "Smoke test passed on attempt $i"
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "::warning::Smoke test could not verify service health"
+
+      # Rollback on failure
+      - name: Rollback on Failure
+        if: failure() && steps.get-current-task.outputs.task-definition != ''
+        run: |
+          echo "Deployment failed, rolling back..."
+          aws ecs update-service \
+            --cluster tripalta-staging \
+            --service ${{ inputs.service-name }}-staging \
+            --task-definition ${{ steps.get-current-task.outputs.task-definition }}
+          aws ecs wait services-stable \
+            --cluster tripalta-staging \
+            --services ${{ inputs.service-name }}-staging
+
+      - name: Update Deployment Status
+        if: always()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: ${{ github.token }}
+          state: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deployment-id: ${{ steps.deploy.outputs.deployment_id }}
+
+      - name: Notify Slack on Staging Deployment
+        if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":rocket: Deployed to Staging: ${{ inputs.service-name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":rocket: *Deployed to Staging*\n*Service:* ${{ inputs.service-name }}\n*Version:* `staging-${{ github.sha }}`\n*Author:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Notify Slack on Staging Failure
+        if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":warning: Staging Deployment Failed: ${{ inputs.service-name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":warning: *Staging Deployment Failed*\n*Service:* ${{ inputs.service-name }}\n*Rolled back to:* ${{ steps.get-current-task.outputs.task-definition || 'N/A' }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
   deploy-production:
     name: Deploy to Production
     needs: build-and-test
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
-    environment: production
+    environment:
+      name: production
+      url: https://api.tripalta.com
+    outputs:
+      previous-task-def: ${{ steps.get-current-task.outputs.task-definition }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -172,16 +367,38 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and Push Docker Image
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: tripalta/${{ inputs.service-name }}
-          IMAGE_TAG: prod-${{ github.sha }}
+      # Store current task definition for potential rollback
+      - name: Get Current Task Definition
+        id: get-current-task
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          CURRENT_TASK=$(aws ecs describe-services \
+            --cluster tripalta-production \
+            --services ${{ inputs.service-name }}-prod \
+            --query 'services[0].taskDefinition' \
+            --output text 2>/dev/null || echo "")
+          echo "task-definition=$CURRENT_TASK" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/tripalta/${{ inputs.service-name }}:prod-${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/tripalta/${{ inputs.service-name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create GitHub Deployment
+        id: deploy
+        uses: chrnorm/deployment-action@v2
+        with:
+          token: ${{ github.token }}
+          environment: production
+          ref: ${{ github.sha }}
 
       - name: Update ECS Service
         run: |
@@ -195,3 +412,105 @@ jobs:
           aws ecs wait services-stable \
             --cluster tripalta-production \
             --services ${{ inputs.service-name }}-prod
+
+      # Post-deployment smoke test
+      - name: Smoke Test
+        run: |
+          echo "Running production smoke test for ${{ inputs.service-name }}"
+          sleep 10
+          HEALTH_URL="http://${{ inputs.service-name }}-prod.tripalta.internal:8083/health"
+          for i in {1..5}; do
+            if curl -sf --max-time 10 "$HEALTH_URL" > /dev/null 2>&1; then
+              echo "Smoke test passed on attempt $i"
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "::warning::Smoke test could not verify service health"
+
+      # Rollback on failure
+      - name: Rollback on Failure
+        if: failure() && steps.get-current-task.outputs.task-definition != ''
+        run: |
+          echo "::error::Production deployment failed, rolling back..."
+          aws ecs update-service \
+            --cluster tripalta-production \
+            --service ${{ inputs.service-name }}-prod \
+            --task-definition ${{ steps.get-current-task.outputs.task-definition }}
+          aws ecs wait services-stable \
+            --cluster tripalta-production \
+            --services ${{ inputs.service-name }}-prod
+
+      - name: Update Deployment Status
+        if: always()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: ${{ github.token }}
+          state: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deployment-id: ${{ steps.deploy.outputs.deployment_id }}
+
+      # Generate changelog
+      - name: Generate Changelog
+        if: success()
+        uses: mikepenz/release-changelog-builder-action@v4
+        id: changelog
+        with:
+          configuration: ".github/changelog-config.json"
+          ignorePreReleases: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        continue-on-error: true
+
+      - name: Notify Slack on Production Deployment
+        if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":white_check_mark: Deployed to Production: ${{ inputs.service-name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: *Deployed to Production*\n*Service:* ${{ inputs.service-name }}\n*Version:* `prod-${{ github.sha }}`\n*Author:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Notify Slack on Production Failure
+        if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": ":rotating_light: PRODUCTION Deployment Failed: ${{ inputs.service-name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":rotating_light: *PRODUCTION Deployment Failed*\n*Service:* ${{ inputs.service-name }}\n*Rolled back to:* ${{ steps.get-current-task.outputs.task-definition || 'N/A' }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "View Workflow"},
+                      "style": "danger",
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
