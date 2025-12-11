@@ -6,15 +6,38 @@ Centralized GitHub Actions reusable workflows and composite actions for all Trip
 
 This repository contains shared CI/CD workflows that are called by all TripAlta service repositories. This centralized approach ensures consistency and makes maintenance easier.
 
-## Workflows
+## Available Workflows
+
+### Backend Services
 
 | Workflow | Purpose | Used By |
 |----------|---------|---------|
-| `java-service.yml` | Spring Boot services CI/CD | api-gateway, user-service, notification-service, trip-service, booking-service, social-service, billing-service |
+| `java-service.yml` | Spring Boot microservices CI/CD | api-gateway, user-service, notification-service, trip-service, booking-service, social-service, billing-service |
 | `python-service.yml` | FastAPI services CI/CD | ai-service |
-| `react-frontend.yml` | React web app CI/CD | tripalta-ui |
-| `react-native.yml` | Expo/React Native CI/CD | tripalta-mobile |
-| `database.yml` | Database migrations CI/CD | user-db, notification-db, trip-db, ai-db, booking-db, social-db, billing-db |
+
+### Databases
+
+| Workflow | Purpose | Used By |
+|----------|---------|---------|
+| `database.yml` | Database migrations CI/CD (Flyway) | user-db, notification-db, trip-db, ai-db, booking-db, social-db, billing-db |
+
+**Database Workflow Features:**
+- 5 parallel validation jobs (lint-sql, validate-syntax, validate-schema, security, unit-tests)
+- Sequential test-migrations job with PostgreSQL service container
+- Staging/Production deployment with AWS Secrets Manager integration
+- CI Summary with consolidated job results
+
+### Frontend
+
+| Workflow | Purpose | Used By |
+|----------|---------|---------|
+| `react-frontend.yml` | React web application CI/CD | tripalta-ui |
+| `react-native.yml` | Expo/React Native mobile CI/CD | tripalta-mobile |
+
+### Infrastructure & Testing
+
+| Workflow | Purpose | Used By |
+|----------|---------|---------|
 | `terraform.yml` | Infrastructure as Code CI/CD | tripalta-infra |
 | `e2e-tests.yml` | End-to-end testing | tripalta-e2e-tests |
 
@@ -83,6 +106,36 @@ jobs:
     with:
       app-name: tripalta-ui
 ```
+
+### Database Example
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+on:
+  push:
+    branches: [develop, main, 'feature/**', 'bugfix/**', 'hotfix/**', 'fix/**']
+  pull_request:
+    branches: [develop, main]
+
+jobs:
+  ci:
+    uses: TripAlta/tripalta-workflows/.github/workflows/database.yml@main
+    secrets: inherit
+    with:
+      db-name: ai_db
+      flyway-version: '10.21.0'
+```
+
+**Database Workflow Inputs:**
+| Input | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `db-name` | Yes | - | Database name (e.g., ai_db, user_db) |
+| `flyway-version` | No | 10.21.0 | Flyway CLI version |
+| `node-version` | No | 20 | Node.js version |
+| `java-version` | No | 21 | Java version for Flyway |
+| `postgres-version` | No | 17 | PostgreSQL version for testing |
+| `enable-slack-notifications` | No | false | Enable Slack notifications |
 
 ## Workflow Triggers
 
