@@ -223,8 +223,8 @@ jobs:
         id: get-current-task
         run: |
           CURRENT_TASK=$(aws ecs describe-services \
-            --cluster tripalta-staging \
-            --services ${{ inputs.service-name }}-staging \
+            --cluster tripalta-staging-cluster \
+            --services ${{ inputs.service-name }} \
             --query 'services[0].taskDefinition' \
             --output text 2>/dev/null || echo "")
           echo "task-definition=$CURRENT_TASK" >> $GITHUB_OUTPUT
@@ -238,8 +238,8 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{ steps.login-ecr.outputs.registry }}/tripalta/${{ inputs.service-name }}:staging-${{ github.sha }}
-            ${{ steps.login-ecr.outputs.registry }}/tripalta/${{ inputs.service-name }}:staging-latest
+            ${{ steps.login-ecr.outputs.registry }}/tripalta-staging/${{ inputs.service-name }}:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/tripalta-staging/${{ inputs.service-name }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -254,22 +254,22 @@ jobs:
       - name: Update ECS Service
         run: |
           aws ecs update-service \
-            --cluster tripalta-staging \
-            --service ${{ inputs.service-name }}-staging \
+            --cluster tripalta-staging-cluster \
+            --service ${{ inputs.service-name }} \
             --force-new-deployment
 
       - name: Wait for Service Stability
         run: |
           aws ecs wait services-stable \
-            --cluster tripalta-staging \
-            --services ${{ inputs.service-name }}-staging
+            --cluster tripalta-staging-cluster \
+            --services ${{ inputs.service-name }}
 
       # Post-deployment smoke test
       - name: Smoke Test
         run: |
           echo "Running smoke test for ${{ inputs.service-name }}"
           sleep 10
-          HEALTH_URL="http://${{ inputs.service-name }}-staging.tripalta.internal:8083/health"
+          HEALTH_URL="http://${{ inputs.service-name }}.tripalta.internal:8083/health"
           for i in {1..5}; do
             if curl -sf --max-time 10 "$HEALTH_URL" > /dev/null 2>&1; then
               echo "Smoke test passed on attempt $i"
@@ -286,12 +286,12 @@ jobs:
         run: |
           echo "Deployment failed, rolling back..."
           aws ecs update-service \
-            --cluster tripalta-staging \
-            --service ${{ inputs.service-name }}-staging \
+            --cluster tripalta-staging-cluster \
+            --service ${{ inputs.service-name }} \
             --task-definition ${{ steps.get-current-task.outputs.task-definition }}
           aws ecs wait services-stable \
-            --cluster tripalta-staging \
-            --services ${{ inputs.service-name }}-staging
+            --cluster tripalta-staging-cluster \
+            --services ${{ inputs.service-name }}
 
       - name: Update Deployment Status
         if: always()
@@ -372,8 +372,8 @@ jobs:
         id: get-current-task
         run: |
           CURRENT_TASK=$(aws ecs describe-services \
-            --cluster tripalta-production \
-            --services ${{ inputs.service-name }}-prod \
+            --cluster tripalta-prod-cluster \
+            --services ${{ inputs.service-name }} \
             --query 'services[0].taskDefinition' \
             --output text 2>/dev/null || echo "")
           echo "task-definition=$CURRENT_TASK" >> $GITHUB_OUTPUT
@@ -387,8 +387,8 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{ steps.login-ecr.outputs.registry }}/tripalta/${{ inputs.service-name }}:prod-${{ github.sha }}
-            ${{ steps.login-ecr.outputs.registry }}/tripalta/${{ inputs.service-name }}:latest
+            ${{ steps.login-ecr.outputs.registry }}/tripalta-prod/${{ inputs.service-name }}:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/tripalta-prod/${{ inputs.service-name }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -403,22 +403,22 @@ jobs:
       - name: Update ECS Service
         run: |
           aws ecs update-service \
-            --cluster tripalta-production \
-            --service ${{ inputs.service-name }}-prod \
+            --cluster tripalta-prod-cluster \
+            --service ${{ inputs.service-name }} \
             --force-new-deployment
 
       - name: Wait for Service Stability
         run: |
           aws ecs wait services-stable \
-            --cluster tripalta-production \
-            --services ${{ inputs.service-name }}-prod
+            --cluster tripalta-prod-cluster \
+            --services ${{ inputs.service-name }}
 
       # Post-deployment smoke test
       - name: Smoke Test
         run: |
           echo "Running production smoke test for ${{ inputs.service-name }}"
           sleep 10
-          HEALTH_URL="http://${{ inputs.service-name }}-prod.tripalta.internal:8083/health"
+          HEALTH_URL="http://${{ inputs.service-name }}.tripalta.internal:8083/health"
           for i in {1..5}; do
             if curl -sf --max-time 10 "$HEALTH_URL" > /dev/null 2>&1; then
               echo "Smoke test passed on attempt $i"
@@ -435,12 +435,12 @@ jobs:
         run: |
           echo "::error::Production deployment failed, rolling back..."
           aws ecs update-service \
-            --cluster tripalta-production \
-            --service ${{ inputs.service-name }}-prod \
+            --cluster tripalta-prod-cluster \
+            --service ${{ inputs.service-name }} \
             --task-definition ${{ steps.get-current-task.outputs.task-definition }}
           aws ecs wait services-stable \
-            --cluster tripalta-production \
-            --services ${{ inputs.service-name }}-prod
+            --cluster tripalta-prod-cluster \
+            --services ${{ inputs.service-name }}
 
       - name: Update Deployment Status
         if: always()

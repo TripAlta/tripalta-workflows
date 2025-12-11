@@ -352,20 +352,49 @@ jobs:
     if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: staging
+    outputs:
+      previous-task-def: ${{ steps.get-current-task.outputs.task-definition }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Node.js ${{ inputs.node-version }}
-        uses: actions/setup-node@v4
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          node-version: ${{ inputs.node-version }}
-          cache: 'npm'
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
 
-      - name: Install and Build
-        run: npm ci && npm run build
-        env:
-          VITE_API_URL: ${{ vars.STAGING_API_URL || 'https://staging-api.tripalta.com' }}
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Store current task definition for potential rollback
+      - name: Get Current Task Definition
+        id: get-current-task
+        run: |
+          CURRENT_TASK=$(aws ecs describe-services \
+            --cluster tripalta-staging-cluster \
+            --services ${{ inputs.app-name }} \
+            --query 'services[0].taskDefinition' \
+            --output text 2>/dev/null || echo "")
+          echo "task-definition=$CURRENT_TASK" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          build-args: |
+            VITE_API_BASE_URL=${{ vars.STAGING_API_URL || 'https://stg-api.tripalta.com' }}
+            VITE_ENVIRONMENT=staging
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/tripalta-staging/${{ inputs.app-name }}:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/tripalta-staging/${{ inputs.app-name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Create GitHub Deployment
         id: deploy
@@ -375,27 +404,24 @@ jobs:
           environment: staging
           ref: ${{ github.sha }}
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
-
-      - name: Deploy to S3
-        run: aws s3 sync dist/ s3://tripalta-staging-frontend --delete
-
-      - name: Invalidate CloudFront Cache
-        if: secrets.CLOUDFRONT_STAGING_ID != ''
+      - name: Update ECS Service
         run: |
-          aws cloudfront create-invalidation \
-            --distribution-id ${{ secrets.CLOUDFRONT_STAGING_ID }} \
-            --paths "/*"
+          aws ecs update-service \
+            --cluster tripalta-staging-cluster \
+            --service ${{ inputs.app-name }} \
+            --force-new-deployment
+
+      - name: Wait for Service Stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster tripalta-staging-cluster \
+            --services ${{ inputs.app-name }}
 
       # Smoke test
       - name: Smoke Test
         run: |
-          sleep 30
-          STAGING_URL="${{ vars.STAGING_FRONTEND_URL || 'https://staging.tripalta.com' }}"
+          sleep 10
+          STAGING_URL="${{ vars.STAGING_FRONTEND_URL || 'https://stg.tripalta.com' }}"
           for i in {1..5}; do
             if curl -sf --max-time 10 "$STAGING_URL" > /dev/null 2>&1; then
               echo "Staging site is accessible"
@@ -406,6 +432,19 @@ jobs:
           done
           echo "::warning::Could not verify staging site accessibility"
 
+      # Rollback on failure
+      - name: Rollback on Failure
+        if: failure() && steps.get-current-task.outputs.task-definition != ''
+        run: |
+          echo "Deployment failed, rolling back..."
+          aws ecs update-service \
+            --cluster tripalta-staging-cluster \
+            --service ${{ inputs.app-name }} \
+            --task-definition ${{ steps.get-current-task.outputs.task-definition }}
+          aws ecs wait services-stable \
+            --cluster tripalta-staging-cluster \
+            --services ${{ inputs.app-name }}
+
       - name: Update Deployment Status
         if: always()
         uses: chrnorm/deployment-status@v2
@@ -413,7 +452,7 @@ jobs:
           token: ${{ github.token }}
           state: ${{ job.status == 'success' && 'success' || 'failure' }}
           deployment-id: ${{ steps.deploy.outputs.deployment_id }}
-          environment-url: ${{ vars.STAGING_FRONTEND_URL || 'https://staging.tripalta.com' }}
+          environment-url: ${{ vars.STAGING_FRONTEND_URL || 'https://stg.tripalta.com' }}
 
       - name: Notify Slack on Staging Deployment
         if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
@@ -427,7 +466,7 @@ jobs:
                   "type": "section",
                   "text": {
                     "type": "mrkdwn",
-                    "text": ":rocket: *Deployed to Staging*\n*App:* ${{ inputs.app-name }}\n*URL:* ${{ vars.STAGING_FRONTEND_URL || 'https://staging.tripalta.com' }}\n*Author:* ${{ github.actor }}"
+                    "text": ":rocket: *Deployed to Staging*\n*App:* ${{ inputs.app-name }}\n*URL:* ${{ vars.STAGING_FRONTEND_URL || 'https://stg.tripalta.com' }}\n*Author:* ${{ github.actor }}"
                   }
                 }
               ]
@@ -448,7 +487,7 @@ jobs:
                   "type": "section",
                   "text": {
                     "type": "mrkdwn",
-                    "text": ":warning: *Staging Deployment Failed*\n*App:* ${{ inputs.app-name }}\n*Branch:* ${{ github.ref_name }}"
+                    "text": ":warning: *Staging Deployment Failed*\n*App:* ${{ inputs.app-name }}\n*Branch:* ${{ github.ref_name }}\n*Rolled back to:* ${{ steps.get-current-task.outputs.task-definition || 'N/A' }}"
                   }
                 }
               ]
@@ -465,20 +504,49 @@ jobs:
     environment:
       name: production
       url: https://tripalta.com
+    outputs:
+      previous-task-def: ${{ steps.get-current-task.outputs.task-definition }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Node.js ${{ inputs.node-version }}
-        uses: actions/setup-node@v4
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          node-version: ${{ inputs.node-version }}
-          cache: 'npm'
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
 
-      - name: Install and Build
-        run: npm ci && npm run build:production || npm run build
-        env:
-          VITE_API_URL: ${{ vars.PROD_API_URL || 'https://api.tripalta.com' }}
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Store current task definition for potential rollback
+      - name: Get Current Task Definition
+        id: get-current-task
+        run: |
+          CURRENT_TASK=$(aws ecs describe-services \
+            --cluster tripalta-prod-cluster \
+            --services ${{ inputs.app-name }} \
+            --query 'services[0].taskDefinition' \
+            --output text 2>/dev/null || echo "")
+          echo "task-definition=$CURRENT_TASK" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          build-args: |
+            VITE_API_BASE_URL=${{ vars.PROD_API_URL || 'https://api.tripalta.com' }}
+            VITE_ENVIRONMENT=production
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/tripalta-prod/${{ inputs.app-name }}:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/tripalta-prod/${{ inputs.app-name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Create GitHub Deployment
         id: deploy
@@ -488,26 +556,23 @@ jobs:
           environment: production
           ref: ${{ github.sha }}
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
-
-      - name: Deploy to S3
-        run: aws s3 sync dist/ s3://tripalta-production-frontend --delete
-
-      - name: Invalidate CloudFront Cache
-        if: secrets.CLOUDFRONT_PROD_ID != ''
+      - name: Update ECS Service
         run: |
-          aws cloudfront create-invalidation \
-            --distribution-id ${{ secrets.CLOUDFRONT_PROD_ID }} \
-            --paths "/*"
+          aws ecs update-service \
+            --cluster tripalta-prod-cluster \
+            --service ${{ inputs.app-name }} \
+            --force-new-deployment
+
+      - name: Wait for Service Stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster tripalta-prod-cluster \
+            --services ${{ inputs.app-name }}
 
       # Smoke test
       - name: Smoke Test
         run: |
-          sleep 30
+          sleep 10
           PROD_URL="${{ vars.PROD_FRONTEND_URL || 'https://tripalta.com' }}"
           for i in {1..5}; do
             if curl -sf --max-time 10 "$PROD_URL" > /dev/null 2>&1; then
@@ -518,6 +583,19 @@ jobs:
             sleep 10
           done
           echo "::warning::Could not verify production site accessibility"
+
+      # Rollback on failure
+      - name: Rollback on Failure
+        if: failure() && steps.get-current-task.outputs.task-definition != ''
+        run: |
+          echo "::error::Production deployment failed, rolling back..."
+          aws ecs update-service \
+            --cluster tripalta-prod-cluster \
+            --service ${{ inputs.app-name }} \
+            --task-definition ${{ steps.get-current-task.outputs.task-definition }}
+          aws ecs wait services-stable \
+            --cluster tripalta-prod-cluster \
+            --services ${{ inputs.app-name }}
 
       - name: Update Deployment Status
         if: always()
@@ -573,7 +651,7 @@ jobs:
                   "type": "section",
                   "text": {
                     "type": "mrkdwn",
-                    "text": ":rotating_light: *PRODUCTION Deployment Failed*\n*App:* ${{ inputs.app-name }}\n*Branch:* main"
+                    "text": ":rotating_light: *PRODUCTION Deployment Failed*\n*App:* ${{ inputs.app-name }}\n*Branch:* main\n*Rolled back to:* ${{ steps.get-current-task.outputs.task-definition || 'N/A' }}"
                   }
                 },
                 {
