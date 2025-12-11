@@ -2,6 +2,16 @@ name: Database CI/CD
 
 on:
   workflow_call:
+    secrets:
+      AWS_ROLE_ARN_STAGING:
+        description: 'AWS IAM role ARN for staging deployments (OIDC)'
+        required: false
+      AWS_ROLE_ARN_PROD:
+        description: 'AWS IAM role ARN for production deployments (OIDC)'
+        required: false
+      SLACK_WEBHOOK_URL:
+        description: 'Slack webhook URL for notifications'
+        required: false
     inputs:
       db-name:
         description: 'Name of the database (e.g., ai_db, user_db)'
