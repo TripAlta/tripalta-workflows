@@ -59,14 +59,14 @@ jobs:
     name: Build & Test
     runs-on: ubuntu-latest
     env:
-      POSTGRES_DB: ${{ inputs.db-name }}
+      POSTGRES_DB: test_db
     services:
       postgres:
         image: postgres:17
         env:
           POSTGRES_USER: test_user
           POSTGRES_PASSWORD: test_password
-          POSTGRES_DB: ${{ inputs.db-name }}
+          POSTGRES_DB: test_db
         ports:
           - 5432:5432
         options: >-
