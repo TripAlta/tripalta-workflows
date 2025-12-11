@@ -173,7 +173,8 @@ jobs:
 
       # Notify on build failure
       - name: Notify Slack on Build Failure
-        if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        if: failure() && inputs.enable-slack-notifications
+        continue-on-error: true
         uses: slackapi/slack-github-action@v2.1.1
         with:
           payload: |
@@ -233,8 +234,8 @@ jobs:
           VITE_ENVIRONMENT: preview
 
       - name: Configure AWS Credentials
-        if: secrets.AWS_ROLE_ARN_PREVIEW != ''
         uses: aws-actions/configure-aws-credentials@v5
+        continue-on-error: true
         with:
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
           role-to-assume: ${{ secrets.AWS_ROLE_ARN_PREVIEW }}
@@ -301,7 +302,8 @@ jobs:
             }
 
       - name: Notify Slack on PR Preview
-        if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        if: success() && inputs.enable-slack-notifications
+        continue-on-error: true
         uses: slackapi/slack-github-action@v2.1.1
         with:
           payload: |
@@ -330,8 +332,8 @@ jobs:
       id-token: write
     steps:
       - name: Configure AWS Credentials
-        if: secrets.AWS_ROLE_ARN_PREVIEW != ''
         uses: aws-actions/configure-aws-credentials@v5
+        continue-on-error: true
         with:
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
           role-to-assume: ${{ secrets.AWS_ROLE_ARN_PREVIEW }}
@@ -455,7 +457,8 @@ jobs:
           environment-url: ${{ vars.STAGING_FRONTEND_URL || 'https://stg.tripalta.com' }}
 
       - name: Notify Slack on Staging Deployment
-        if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        if: success() && inputs.enable-slack-notifications
+        continue-on-error: true
         uses: slackapi/slack-github-action@v2.1.1
         with:
           payload: |
@@ -476,7 +479,8 @@ jobs:
           SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
       - name: Notify Slack on Staging Failure
-        if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        if: failure() && inputs.enable-slack-notifications
+        continue-on-error: true
         uses: slackapi/slack-github-action@v2.1.1
         with:
           payload: |
@@ -619,7 +623,8 @@ jobs:
         continue-on-error: true
 
       - name: Notify Slack on Production Deployment
-        if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        if: success() && inputs.enable-slack-notifications
+        continue-on-error: true
         uses: slackapi/slack-github-action@v2.1.1
         with:
           payload: |
@@ -640,7 +645,8 @@ jobs:
           SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
       - name: Notify Slack on Production Failure
-        if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        if: failure() && inputs.enable-slack-notifications
+        continue-on-error: true
         uses: slackapi/slack-github-action@v2.1.1
         with:
           payload: |
