@@ -175,7 +175,7 @@ jobs:
       # Notify on build failure
       - name: Notify Slack on Build Failure
         if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
-        uses: slackapi/slack-github-action@v1.26.0
+        uses: slackapi/slack-github-action@v2.1.1
         with:
           payload: |
             {
@@ -332,7 +332,7 @@ jobs:
       # Slack notification for staging deployment
       - name: Notify Slack on Staging Deployment
         if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
-        uses: slackapi/slack-github-action@v1.26.0
+        uses: slackapi/slack-github-action@v2.1.1
         with:
           payload: |
             {
@@ -353,7 +353,7 @@ jobs:
 
       - name: Notify Slack on Staging Failure
         if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
-        uses: slackapi/slack-github-action@v1.26.0
+        uses: slackapi/slack-github-action@v2.1.1
         with:
           payload: |
             {
@@ -546,7 +546,7 @@ jobs:
       # Slack notification for production deployment
       - name: Notify Slack on Production Deployment
         if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
-        uses: slackapi/slack-github-action@v1.26.0
+        uses: slackapi/slack-github-action@v2.1.1
         with:
           payload: |
             {
@@ -576,7 +576,7 @@ jobs:
 
       - name: Notify Slack on Production Failure
         if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
-        uses: slackapi/slack-github-action@v1.26.0
+        uses: slackapi/slack-github-action@v2.1.1
         with:
           payload: |
             {
