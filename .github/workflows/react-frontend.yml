@@ -51,11 +51,6 @@ concurrency:
   group: react-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  id-token: write
-  contents: read
-  pull-requests: write
-
 jobs:
   build-and-test:
     name: Build & Test
