@@ -219,6 +219,12 @@ jobs:
             sleep 2
           done
 
+      - name: Create Required Extensions
+        run: |
+          PGPASSWORD=${{ env.POSTGRES_PASSWORD }} psql -h localhost -U ${{ env.POSTGRES_USER }} -d ${{ env.POSTGRES_DB }} -c "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"
+          PGPASSWORD=${{ env.POSTGRES_PASSWORD }} psql -h localhost -U ${{ env.POSTGRES_USER }} -d ${{ env.POSTGRES_DB }} -c "CREATE EXTENSION IF NOT EXISTS \"pgcrypto\";"
+          echo "PostgreSQL extensions created successfully"
+
       - name: Run Flyway Migrations
         run: |
           # Find migration locations (check for TA-* release folders or flat structure)
