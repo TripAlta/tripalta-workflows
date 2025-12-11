@@ -7,6 +7,11 @@ on:
         description: 'Name of the database (e.g., ai_db, user_db)'
         required: true
         type: string
+      db-repo-name:
+        description: 'Repository name for ECR (e.g., trip-db). Defaults to db-name with _ replaced by -'
+        required: false
+        type: string
+        default: ''
       flyway-version:
         description: 'Flyway CLI version'
         required: false
@@ -32,6 +37,11 @@ on:
         required: false
         type: boolean
         default: false
+      use-ecs-migration:
+        description: 'Use ECS Fargate task for migrations (recommended for private RDS)'
+        required: false
+        type: boolean
+        default: true
 
 concurrency:
   group: database-${{ github.workflow }}-${{ github.ref }}
@@ -256,40 +266,122 @@ jobs:
           PGPASSWORD: ${{ env.POSTGRES_PASSWORD }}
 
   # ========================================
+  # BUILD JOB: Build and Push Docker Image
+  # ========================================
+
+  build-push-image:
+    name: Build & Push Migrator Image
+    runs-on: ubuntu-latest
+    needs: test-migrations
+    if: |
+      inputs.use-ecs-migration &&
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+      image-uri: ${{ steps.build.outputs.image-uri }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Determine DB repo name
+        id: db-repo
+        run: |
+          if [ -n "${{ inputs.db-repo-name }}" ]; then
+            echo "name=${{ inputs.db-repo-name }}" >> $GITHUB_OUTPUT
+          else
+            # Convert db-name (e.g., trip_db) to repo name (e.g., trip-db)
+            REPO_NAME=$(echo "${{ inputs.db-name }}" | sed 's/_/-/g')
+            echo "name=$REPO_NAME" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure AWS Credentials (Staging)
+        if: github.ref == 'refs/heads/develop'
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+
+      - name: Configure AWS Credentials (Production)
+        if: github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v3
+
+      - name: Set environment prefix
+        id: env-prefix
+        run: |
+          if [ "${{ github.ref }}" == "refs/heads/develop" ]; then
+            echo "prefix=tripalta-staging" >> $GITHUB_OUTPUT
+          else
+            echo "prefix=tripalta-production" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.login-ecr.outputs.registry }}/${{ steps.env-prefix.outputs.prefix }}/${{ steps.db-repo.outputs.name }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/arm64
+
+      - name: Output image URI
+        run: |
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ steps.env-prefix.outputs.prefix }}/${{ steps.db-repo.outputs.name }}:${{ steps.meta.outputs.version }}"
+          echo "image-uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Built and pushed: $IMAGE_URI"
+
+  # ========================================
   # DEPLOYMENT JOB: Deploy to Staging
   # ========================================
 
   deploy-staging:
     name: Deploy to Staging
     runs-on: ubuntu-latest
-    needs: test-migrations
-    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    needs: [test-migrations, build-push-image]
+    if: |
+      always() &&
+      needs.test-migrations.result == 'success' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/develop'
     environment:
       name: staging
-    continue-on-error: true  # Non-blocking until VPC connectivity is configured
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
 
-      - name: Set up Java ${{ inputs.java-version }}
-        uses: actions/setup-java@v5
-        with:
-          distribution: 'temurin'
-          java-version: ${{ inputs.java-version }}
-
-      - name: Set up Node.js ${{ inputs.node-version }}
-        uses: actions/setup-node@v6
-        with:
-          node-version: ${{ inputs.node-version }}
-
-      - name: Install Dependencies
-        run: npm ci || npm install
-
-      - name: Install Flyway CLI
+      - name: Determine DB repo name
+        id: db-repo
         run: |
-          wget -qO- https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/${{ inputs.flyway-version }}/flyway-commandline-${{ inputs.flyway-version }}-linux-x64.tar.gz | tar xvz
-          sudo ln -s $(pwd)/flyway-${{ inputs.flyway-version }}/flyway /usr/local/bin/flyway
+          if [ -n "${{ inputs.db-repo-name }}" ]; then
+            echo "name=${{ inputs.db-repo-name }}" >> $GITHUB_OUTPUT
+          else
+            REPO_NAME=$(echo "${{ inputs.db-name }}" | sed 's/_/-/g')
+            echo "name=$REPO_NAME" >> $GITHUB_OUTPUT
+          fi
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v5
@@ -297,7 +389,103 @@ jobs:
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
           role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
 
+      # ECS-based migration (recommended for private RDS)
+      - name: Run ECS Migration Task
+        if: inputs.use-ecs-migration && needs.build-push-image.result == 'success'
+        id: run-task
+        run: |
+          echo "Starting ECS migration task for ${{ inputs.db-name }}..."
+
+          # Get infrastructure details from SSM or use defaults
+          CLUSTER="${{ vars.ECS_CLUSTER_STAGING || 'tripalta-staging-cluster' }}"
+          TASK_FAMILY="tripalta-staging-database-migrator-${{ steps.db-repo.outputs.name }}"
+          SUBNETS="${{ vars.PRIVATE_APP_SUBNETS_STAGING }}"
+          SECURITY_GROUP="${{ vars.ECS_SECURITY_GROUP_STAGING }}"
+
+          if [ -z "$SUBNETS" ] || [ -z "$SECURITY_GROUP" ]; then
+            echo "ERROR: PRIVATE_APP_SUBNETS_STAGING and ECS_SECURITY_GROUP_STAGING variables must be set"
+            exit 1
+          fi
+
+          # Run the ECS task
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$CLUSTER" \
+            --task-definition "$TASK_FAMILY" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUP],assignPublicIp=DISABLED}" \
+            --query 'tasks[0].taskArn' \
+            --output text)
+
+          if [ "$TASK_ARN" == "None" ] || [ -z "$TASK_ARN" ]; then
+            echo "ERROR: Failed to start ECS task"
+            exit 1
+          fi
+
+          echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
+          echo "Migration task started: $TASK_ARN"
+
+      - name: Wait for Task Completion
+        if: inputs.use-ecs-migration && needs.build-push-image.result == 'success'
+        run: |
+          echo "Waiting for migration task to complete..."
+          CLUSTER="${{ vars.ECS_CLUSTER_STAGING || 'tripalta-staging-cluster' }}"
+
+          aws ecs wait tasks-stopped \
+            --cluster "$CLUSTER" \
+            --tasks "${{ steps.run-task.outputs.task_arn }}"
+
+          echo "Task completed"
+
+      - name: Check Task Result
+        if: inputs.use-ecs-migration && needs.build-push-image.result == 'success'
+        run: |
+          CLUSTER="${{ vars.ECS_CLUSTER_STAGING || 'tripalta-staging-cluster' }}"
+          TASK_ARN="${{ steps.run-task.outputs.task_arn }}"
+          TASK_ID=$(echo "$TASK_ARN" | rev | cut -d'/' -f1 | rev)
+
+          # Get exit code
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster "$CLUSTER" \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].containers[0].exitCode' \
+            --output text)
+
+          echo "Task exit code: $EXIT_CODE"
+
+          # Fetch CloudWatch logs
+          LOG_GROUP="/ecs/tripalta-staging/migrations"
+          LOG_STREAM="${{ steps.db-repo.outputs.name }}/flyway-migrator/$TASK_ID"
+
+          echo "=== Migration Logs ==="
+          aws logs get-log-events \
+            --log-group-name "$LOG_GROUP" \
+            --log-stream-name "$LOG_STREAM" \
+            --query 'events[*].message' \
+            --output text 2>/dev/null || echo "Could not fetch logs (stream may not exist yet)"
+
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "ERROR: Migration FAILED with exit code $EXIT_CODE"
+            exit 1
+          fi
+
+          echo "Migration completed successfully"
+
+      # Fallback: Direct Flyway execution (for debugging or when ECS is not available)
+      - name: Set up Java ${{ inputs.java-version }}
+        if: "!inputs.use-ecs-migration"
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: ${{ inputs.java-version }}
+
+      - name: Install Flyway CLI
+        if: "!inputs.use-ecs-migration"
+        run: |
+          wget -qO- https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/${{ inputs.flyway-version }}/flyway-commandline-${{ inputs.flyway-version }}-linux-x64.tar.gz | tar xvz
+          sudo ln -s $(pwd)/flyway-${{ inputs.flyway-version }}/flyway /usr/local/bin/flyway
+
       - name: Get RDS Endpoint from Secrets Manager
+        if: "!inputs.use-ecs-migration"
         id: get-rds-endpoint
         run: |
           RDS_SECRET=$(aws secretsmanager get-secret-value --secret-id tripalta/staging/rds --query SecretString --output text 2>/dev/null || echo '{}')
@@ -314,19 +502,15 @@ jobs:
           echo "rds_user=$RDS_USER" >> $GITHUB_OUTPUT
           echo "rds_password=$RDS_PASSWORD" >> $GITHUB_OUTPUT
 
-      - name: Run Flyway Migrations on Staging Aurora
-        if: steps.get-rds-endpoint.outputs.rds_host != ''
+      - name: Run Flyway Migrations (Direct)
+        if: "!inputs.use-ecs-migration && steps.get-rds-endpoint.outputs.rds_host != ''"
         run: |
-          npm run migrate:staging || flyway -url=jdbc:postgresql://${{ steps.get-rds-endpoint.outputs.rds_host }}:${{ steps.get-rds-endpoint.outputs.rds_port }}/${{ inputs.db-name }} -user=${{ steps.get-rds-endpoint.outputs.rds_user }} -password=${{ steps.get-rds-endpoint.outputs.rds_password }} -locations=filesystem:./migrations migrate
-        env:
-          FLYWAY_URL: jdbc:postgresql://${{ steps.get-rds-endpoint.outputs.rds_host }}:${{ steps.get-rds-endpoint.outputs.rds_port }}/${{ inputs.db-name }}
-          FLYWAY_USER: ${{ steps.get-rds-endpoint.outputs.rds_user }}
-          FLYWAY_PASSWORD: ${{ steps.get-rds-endpoint.outputs.rds_password }}
-
-      - name: Verify Migration Status
-        if: steps.get-rds-endpoint.outputs.rds_host != ''
-        run: |
-          npm run info:staging || flyway -url=jdbc:postgresql://${{ steps.get-rds-endpoint.outputs.rds_host }}:${{ steps.get-rds-endpoint.outputs.rds_port }}/${{ inputs.db-name }} -user=${{ steps.get-rds-endpoint.outputs.rds_user }} -password=${{ steps.get-rds-endpoint.outputs.rds_password }} -locations=filesystem:./migrations info
+          flyway \
+            -url=jdbc:postgresql://${{ steps.get-rds-endpoint.outputs.rds_host }}:${{ steps.get-rds-endpoint.outputs.rds_port }}/${{ inputs.db-name }} \
+            -user=${{ steps.get-rds-endpoint.outputs.rds_user }} \
+            -password=${{ steps.get-rds-endpoint.outputs.rds_password }} \
+            -locations=filesystem:./migrations \
+            migrate
         env:
           FLYWAY_URL: jdbc:postgresql://${{ steps.get-rds-endpoint.outputs.rds_host }}:${{ steps.get-rds-endpoint.outputs.rds_port }}/${{ inputs.db-name }}
           FLYWAY_USER: ${{ steps.get-rds-endpoint.outputs.rds_user }}
@@ -360,35 +544,29 @@ jobs:
   deploy-production:
     name: Deploy to Production
     runs-on: ubuntu-latest
-    needs: test-migrations
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test-migrations, build-push-image]
+    if: |
+      always() &&
+      needs.test-migrations.result == 'success' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
     environment:
       name: production
       url: https://tripalta.com
-    continue-on-error: true  # Non-blocking until VPC connectivity is configured
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
 
-      - name: Set up Java ${{ inputs.java-version }}
-        uses: actions/setup-java@v5
-        with:
-          distribution: 'temurin'
-          java-version: ${{ inputs.java-version }}
-
-      - name: Set up Node.js ${{ inputs.node-version }}
-        uses: actions/setup-node@v6
-        with:
-          node-version: ${{ inputs.node-version }}
-
-      - name: Install Dependencies
-        run: npm ci || npm install
-
-      - name: Install Flyway CLI
+      - name: Determine DB repo name
+        id: db-repo
         run: |
-          wget -qO- https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/${{ inputs.flyway-version }}/flyway-commandline-${{ inputs.flyway-version }}-linux-x64.tar.gz | tar xvz
-          sudo ln -s $(pwd)/flyway-${{ inputs.flyway-version }}/flyway /usr/local/bin/flyway
+          if [ -n "${{ inputs.db-repo-name }}" ]; then
+            echo "name=${{ inputs.db-repo-name }}" >> $GITHUB_OUTPUT
+          else
+            REPO_NAME=$(echo "${{ inputs.db-name }}" | sed 's/_/-/g')
+            echo "name=$REPO_NAME" >> $GITHUB_OUTPUT
+          fi
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v5
@@ -396,7 +574,99 @@ jobs:
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
           role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
 
+      # ECS-based migration (recommended for private RDS)
+      - name: Run ECS Migration Task
+        if: inputs.use-ecs-migration && needs.build-push-image.result == 'success'
+        id: run-task
+        run: |
+          echo "Starting ECS migration task for ${{ inputs.db-name }}..."
+
+          CLUSTER="${{ vars.ECS_CLUSTER_PRODUCTION || 'tripalta-production-cluster' }}"
+          TASK_FAMILY="tripalta-production-database-migrator-${{ steps.db-repo.outputs.name }}"
+          SUBNETS="${{ vars.PRIVATE_APP_SUBNETS_PRODUCTION }}"
+          SECURITY_GROUP="${{ vars.ECS_SECURITY_GROUP_PRODUCTION }}"
+
+          if [ -z "$SUBNETS" ] || [ -z "$SECURITY_GROUP" ]; then
+            echo "ERROR: PRIVATE_APP_SUBNETS_PRODUCTION and ECS_SECURITY_GROUP_PRODUCTION variables must be set"
+            exit 1
+          fi
+
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$CLUSTER" \
+            --task-definition "$TASK_FAMILY" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUP],assignPublicIp=DISABLED}" \
+            --query 'tasks[0].taskArn' \
+            --output text)
+
+          if [ "$TASK_ARN" == "None" ] || [ -z "$TASK_ARN" ]; then
+            echo "ERROR: Failed to start ECS task"
+            exit 1
+          fi
+
+          echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
+          echo "Migration task started: $TASK_ARN"
+
+      - name: Wait for Task Completion
+        if: inputs.use-ecs-migration && needs.build-push-image.result == 'success'
+        run: |
+          echo "Waiting for migration task to complete..."
+          CLUSTER="${{ vars.ECS_CLUSTER_PRODUCTION || 'tripalta-production-cluster' }}"
+
+          aws ecs wait tasks-stopped \
+            --cluster "$CLUSTER" \
+            --tasks "${{ steps.run-task.outputs.task_arn }}"
+
+          echo "Task completed"
+
+      - name: Check Task Result
+        if: inputs.use-ecs-migration && needs.build-push-image.result == 'success'
+        run: |
+          CLUSTER="${{ vars.ECS_CLUSTER_PRODUCTION || 'tripalta-production-cluster' }}"
+          TASK_ARN="${{ steps.run-task.outputs.task_arn }}"
+          TASK_ID=$(echo "$TASK_ARN" | rev | cut -d'/' -f1 | rev)
+
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster "$CLUSTER" \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].containers[0].exitCode' \
+            --output text)
+
+          echo "Task exit code: $EXIT_CODE"
+
+          LOG_GROUP="/ecs/tripalta-production/migrations"
+          LOG_STREAM="${{ steps.db-repo.outputs.name }}/flyway-migrator/$TASK_ID"
+
+          echo "=== Migration Logs ==="
+          aws logs get-log-events \
+            --log-group-name "$LOG_GROUP" \
+            --log-stream-name "$LOG_STREAM" \
+            --query 'events[*].message' \
+            --output text 2>/dev/null || echo "Could not fetch logs (stream may not exist yet)"
+
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "ERROR: Migration FAILED with exit code $EXIT_CODE"
+            exit 1
+          fi
+
+          echo "Migration completed successfully"
+
+      # Fallback: Direct Flyway execution
+      - name: Set up Java ${{ inputs.java-version }}
+        if: "!inputs.use-ecs-migration"
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: ${{ inputs.java-version }}
+
+      - name: Install Flyway CLI
+        if: "!inputs.use-ecs-migration"
+        run: |
+          wget -qO- https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/${{ inputs.flyway-version }}/flyway-commandline-${{ inputs.flyway-version }}-linux-x64.tar.gz | tar xvz
+          sudo ln -s $(pwd)/flyway-${{ inputs.flyway-version }}/flyway /usr/local/bin/flyway
+
       - name: Get RDS Endpoint from Secrets Manager
+        if: "!inputs.use-ecs-migration"
         id: get-rds-endpoint
         run: |
           RDS_SECRET=$(aws secretsmanager get-secret-value --secret-id tripalta/prod/rds --query SecretString --output text 2>/dev/null || echo '{}')
@@ -413,19 +683,15 @@ jobs:
           echo "rds_user=$RDS_USER" >> $GITHUB_OUTPUT
           echo "rds_password=$RDS_PASSWORD" >> $GITHUB_OUTPUT
 
-      - name: Run Flyway Migrations on Production Aurora
-        if: steps.get-rds-endpoint.outputs.rds_host != ''
+      - name: Run Flyway Migrations (Direct)
+        if: "!inputs.use-ecs-migration && steps.get-rds-endpoint.outputs.rds_host != ''"
         run: |
-          npm run migrate:production || flyway -url=jdbc:postgresql://${{ steps.get-rds-endpoint.outputs.rds_host }}:${{ steps.get-rds-endpoint.outputs.rds_port }}/${{ inputs.db-name }} -user=${{ steps.get-rds-endpoint.outputs.rds_user }} -password=${{ steps.get-rds-endpoint.outputs.rds_password }} -locations=filesystem:./migrations migrate
-        env:
-          FLYWAY_URL: jdbc:postgresql://${{ steps.get-rds-endpoint.outputs.rds_host }}:${{ steps.get-rds-endpoint.outputs.rds_port }}/${{ inputs.db-name }}
-          FLYWAY_USER: ${{ steps.get-rds-endpoint.outputs.rds_user }}
-          FLYWAY_PASSWORD: ${{ steps.get-rds-endpoint.outputs.rds_password }}
-
-      - name: Verify Migration Status
-        if: steps.get-rds-endpoint.outputs.rds_host != ''
-        run: |
-          npm run info:production || flyway -url=jdbc:postgresql://${{ steps.get-rds-endpoint.outputs.rds_host }}:${{ steps.get-rds-endpoint.outputs.rds_port }}/${{ inputs.db-name }} -user=${{ steps.get-rds-endpoint.outputs.rds_user }} -password=${{ steps.get-rds-endpoint.outputs.rds_password }} -locations=filesystem:./migrations info
+          flyway \
+            -url=jdbc:postgresql://${{ steps.get-rds-endpoint.outputs.rds_host }}:${{ steps.get-rds-endpoint.outputs.rds_port }}/${{ inputs.db-name }} \
+            -user=${{ steps.get-rds-endpoint.outputs.rds_user }} \
+            -password=${{ steps.get-rds-endpoint.outputs.rds_password }} \
+            -locations=filesystem:./migrations \
+            migrate
         env:
           FLYWAY_URL: jdbc:postgresql://${{ steps.get-rds-endpoint.outputs.rds_host }}:${{ steps.get-rds-endpoint.outputs.rds_port }}/${{ inputs.db-name }}
           FLYWAY_USER: ${{ steps.get-rds-endpoint.outputs.rds_user }}
