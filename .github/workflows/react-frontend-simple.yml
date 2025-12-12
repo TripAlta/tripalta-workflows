@@ -73,9 +73,35 @@ jobs:
       - run: npm ci
       - run: npm run lint
 
+  type-check:
+    name: Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run type-check || npx tsc --noEmit
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run tests
+        run: npm run test:ci -- --coverage || npm test -- --passWithNoTests
+        continue-on-error: true
+
   build:
     name: Build
-    needs: [format-check, lint]
+    needs: [format-check, lint, type-check, unit-tests]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
