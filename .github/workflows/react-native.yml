@@ -13,36 +13,26 @@ on:
         type: string
         default: '20'
       build-ios:
-        description: 'Whether iOS builds are enabled (still requires trigger conditions)'
+        description: 'Whether iOS builds are enabled'
         required: false
         type: boolean
-        default: true
+        default: false
       build-android:
-        description: 'Whether to build Android on develop/main'
+        description: 'Whether to build Android'
         required: false
         type: boolean
-        default: true
+        default: false
       enable-slack-notifications:
         description: 'Whether to send Slack notifications'
         required: false
         type: boolean
-        default: true
-      ios-build-trigger:
-        description: 'iOS build trigger mode: always, main-only, or commit-tag (requires [build-ios] in commit)'
-        required: false
-        type: string
-        default: 'commit-tag'
+        default: false
     secrets:
       EXPO_TOKEN:
-        required: false
-      AWS_ROLE_ARN_STAGING:
-        required: false
-      AWS_ROLE_ARN_PROD:
         required: false
       SLACK_WEBHOOK_URL:
         required: false
 
-# Cancel in-progress runs for the same workflow and ref (updated 2025-12-11)
 concurrency:
   group: mobile-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -65,7 +55,6 @@ jobs:
       - name: Install Dependencies
         run: npm ci
 
-      # Security scanning
       - name: Security Audit
         run: |
           npm audit --audit-level=high 2>&1 | tee npm-audit.txt || true
@@ -74,7 +63,6 @@ jobs:
             exit 1
           fi
 
-      # Code Quality Checks
       - name: Check Formatting (Prettier)
         run: npm run format:check || npx prettier --check .
 
@@ -84,289 +72,32 @@ jobs:
       - name: Type Check (TypeScript)
         run: npm run type-check
 
-      # Unit Tests with Coverage
       - name: Run Tests
-        run: |
-          npm run test -- --coverage \
-            --coverageReporters=json-summary \
-            --coverageReporters=lcov \
-            --reporters=default \
-            --reporters=jest-junit 2>/dev/null || \
-          npm run test -- --coverage --passWithNoTests
+        run: npm test -- --coverage --passWithNoTests
         env:
-          JEST_JUNIT_OUTPUT_DIR: ./test-results
+          CI: true
 
-      # Expo Doctor Check
       - name: Expo Doctor
         run: npx expo-doctor || true
 
-      # Upload Test Results
       - name: Upload Test Results
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: test-results-${{ inputs.app-name }}
-          path: |
-            test-results/
-            junit.xml
-          retention-days: 30
-
-      # Upload Coverage
-      - name: Upload Coverage Report
-        uses: actions/upload-artifact@v5
-        with:
-          name: coverage-report-${{ inputs.app-name }}
           path: coverage/
           retention-days: 30
 
-      # Upload Security Audit
       - name: Upload Security Audit
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: security-audit-${{ inputs.app-name }}
           path: npm-audit.txt
           retention-days: 30
 
-      # Generate Test Summary
       - name: Generate Test Summary
         if: always()
         run: |
           echo "## Test Summary" >> $GITHUB_STEP_SUMMARY
-          echo "Tests completed" >> $GITHUB_STEP_SUMMARY
-
-      # Notify on build failure
-      - name: Notify Slack on Build Failure
-        if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
-        uses: slackapi/slack-github-action@v2.1.1
-        with:
-          payload: |
-            {
-              "text": ":x: Build Failed: ${{ inputs.app-name }}",
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": ":x: *Build Failed*\n*App:* ${{ inputs.app-name }}\n*Branch:* ${{ github.ref_name }}\n*Author:* ${{ github.actor }}"
-                  }
-                }
-              ]
-            }
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
-
-  # Determine if iOS build should run
-  check-ios-trigger:
-    name: Check iOS Build Trigger
-    needs: build-and-test
-    if: inputs.build-ios && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
-    runs-on: ubuntu-latest
-    outputs:
-      should-build: ${{ steps.check.outputs.should_build }}
-      reason: ${{ steps.check.outputs.reason }}
-    steps:
-      - name: Check iOS Build Conditions
-        id: check
-        run: |
-          TRIGGER_MODE="${{ inputs.ios-build-trigger }}"
-          BRANCH="${{ github.ref }}"
-          COMMIT_MSG="${{ github.event.head_commit.message }}"
-
-          echo "Trigger mode: ${TRIGGER_MODE}"
-          echo "Branch: ${BRANCH}"
-          echo "Commit message: ${COMMIT_MSG}"
-
-          # Default: don't build
-          SHOULD_BUILD="false"
-          REASON="No trigger condition met"
-
-          # Always build on main for production releases
-          if [ "${BRANCH}" = "refs/heads/main" ]; then
-            SHOULD_BUILD="true"
-            REASON="Production build (main branch)"
-          # Check trigger mode for develop branch
-          elif [ "${BRANCH}" = "refs/heads/develop" ]; then
-            case "${TRIGGER_MODE}" in
-              "always")
-                SHOULD_BUILD="true"
-                REASON="Always build on develop (always mode)"
-                ;;
-              "main-only")
-                SHOULD_BUILD="false"
-                REASON="iOS builds disabled for develop (main-only mode)"
-                ;;
-              "commit-tag")
-                if echo "${COMMIT_MSG}" | grep -qi "\[build-ios\]"; then
-                  SHOULD_BUILD="true"
-                  REASON="Triggered by [build-ios] tag in commit message"
-                else
-                  SHOULD_BUILD="false"
-                  REASON="No [build-ios] tag found (commit-tag mode). Add [build-ios] to commit message to trigger iOS build."
-                fi
-                ;;
-              *)
-                SHOULD_BUILD="false"
-                REASON="Unknown trigger mode: ${TRIGGER_MODE}"
-                ;;
-            esac
-          fi
-
-          echo "should_build=${SHOULD_BUILD}" >> $GITHUB_OUTPUT
-          echo "reason=${REASON}" >> $GITHUB_OUTPUT
-          echo "Decision: SHOULD_BUILD=${SHOULD_BUILD}, Reason: ${REASON}"
-
-      - name: Report iOS Build Decision
-        run: |
-          echo "### iOS Build Decision" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.check.outputs.should_build }}" = "true" ]; then
-            echo "✅ **iOS build will run**" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "⏭️ **iOS build skipped**" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Reason:** ${{ steps.check.outputs.reason }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Trigger Mode:** ${{ inputs.ios-build-trigger }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "> 💡 To trigger iOS builds on develop, add \`[build-ios]\` to your commit message." >> $GITHUB_STEP_SUMMARY
-
-  build-ios:
-    name: Build iOS
-    needs: check-ios-trigger
-    if: needs.check-ios-trigger.outputs.should-build == 'true'
-    runs-on: macos-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js ${{ inputs.node-version }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ inputs.node-version }}
-          cache: 'npm'
-
-      - name: Install Dependencies
-        run: npm ci
-
-      - name: Setup EAS
-        uses: expo/expo-github-action@v8
-        with:
-          eas-version: latest
-          token: ${{ secrets.EXPO_TOKEN }}
-
-      - name: Build iOS
-        run: |
-          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            npx eas build --platform ios --profile production --non-interactive
-          else
-            npx eas build --platform ios --profile preview --non-interactive
-          fi
-
-  build-android:
-    name: Build Android
-    needs: build-and-test
-    if: inputs.build-android && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js ${{ inputs.node-version }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ inputs.node-version }}
-          cache: 'npm'
-
-      - name: Install Dependencies
-        run: npm ci
-
-      - name: Setup EAS
-        uses: expo/expo-github-action@v8
-        with:
-          eas-version: latest
-          token: ${{ secrets.EXPO_TOKEN }}
-
-      - name: Build Android
-        run: |
-          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            npx eas build --platform android --profile production --non-interactive
-          else
-            npx eas build --platform android --profile preview --non-interactive
-          fi
-
-  deploy-staging:
-    name: Deploy to Staging
-    needs: [check-ios-trigger, build-ios, build-android]
-    if: |
-      always() &&
-      github.ref == 'refs/heads/develop' &&
-      github.event_name == 'push' &&
-      (needs.build-ios.result == 'success' || needs.build-android.result == 'success')
-    runs-on: ubuntu-latest
-    environment: staging
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js ${{ inputs.node-version }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ inputs.node-version }}
-          cache: 'npm'
-
-      - name: Install Dependencies
-        run: npm ci
-
-      - name: Setup EAS
-        uses: expo/expo-github-action@v8
-        with:
-          eas-version: latest
-          token: ${{ secrets.EXPO_TOKEN }}
-
-      - name: Submit to TestFlight (iOS)
-        if: needs.build-ios.result == 'success'
-        run: npx eas submit --platform ios --profile staging --non-interactive || true
-
-      - name: Submit to Play Store Internal (Android)
-        if: needs.build-android.result == 'success'
-        run: npx eas submit --platform android --profile staging --non-interactive || true
-
-  deploy-production:
-    name: Deploy to Production
-    needs: [check-ios-trigger, build-ios, build-android]
-    if: |
-      always() &&
-      github.ref == 'refs/heads/main' &&
-      github.event_name == 'push' &&
-      (needs.build-ios.result == 'success' || needs.build-android.result == 'success')
-    runs-on: ubuntu-latest
-    environment: production
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js ${{ inputs.node-version }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ inputs.node-version }}
-          cache: 'npm'
-
-      - name: Install Dependencies
-        run: npm ci
-
-      - name: Setup EAS
-        uses: expo/expo-github-action@v8
-        with:
-          eas-version: latest
-          token: ${{ secrets.EXPO_TOKEN }}
-
-      - name: Submit to App Store (iOS)
-        if: needs.build-ios.result == 'success'
-        run: npx eas submit --platform ios --profile production --non-interactive || true
-
-      - name: Submit to Play Store (Android)
-        if: needs.build-android.result == 'success'
-        run: npx eas submit --platform android --profile production --non-interactive || true
+          echo "Tests completed for ${{ inputs.app-name }}" >> $GITHUB_STEP_SUMMARY
