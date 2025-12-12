@@ -12,18 +12,28 @@ on:
         required: false
         type: string
         default: '20'
+      coverage-threshold:
+        description: 'Minimum coverage percentage'
+        required: false
+        type: string
+        default: '60'
+      enable-slack-notifications:
+        description: 'Whether to send Slack notifications'
+        required: false
+        type: boolean
+        default: false
+      enable-deployment:
+        description: 'Whether to deploy (requires EAS setup)'
+        required: false
+        type: boolean
+        default: false
       build-ios:
-        description: 'Whether iOS builds are enabled'
+        description: 'Whether to build iOS'
         required: false
         type: boolean
         default: false
       build-android:
         description: 'Whether to build Android'
-        required: false
-        type: boolean
-        default: false
-      enable-slack-notifications:
-        description: 'Whether to send Slack notifications'
         required: false
         type: boolean
         default: false
@@ -38,10 +48,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-and-test:
-    name: Build & Test
-    runs-on: ubuntu-latest
+  # ===========================================================================
+  # PHASE 1: Parallel Code Quality Checks
+  # ===========================================================================
 
+  format-check:
+    name: Format Check (Prettier)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -55,49 +69,255 @@ jobs:
       - name: Install Dependencies
         run: npm ci
 
-      - name: Security Audit
+      - name: Check Formatting
+        run: npm run format:check || npx prettier --check .
+
+  lint:
+    name: Lint (ESLint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+  type-check:
+    name: Type Check (TypeScript)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run TypeScript Check
+        run: npm run type-check
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Security Audit
         run: |
+          npm audit --json > npm-audit.json 2>&1 || true
           npm audit --audit-level=high 2>&1 | tee npm-audit.txt || true
+
           if npm audit --audit-level=critical 2>&1 | grep -q "critical"; then
             echo "::error::Critical vulnerabilities found in dependencies"
+            cat npm-audit.txt
             exit 1
           fi
 
-      - name: Check Formatting (Prettier)
-        run: npm run format:check || npx prettier --check .
+          echo "Security audit passed - no critical vulnerabilities found"
 
-      - name: Lint (ESLint)
-        run: npm run lint
-
-      - name: Type Check (TypeScript)
-        run: npm run type-check
-
-      - name: Run Tests
-        run: npm test -- --coverage --passWithNoTests
-        env:
-          CI: true
-
-      - name: Expo Doctor
-        run: npx expo-doctor || true
-
-      - name: Upload Test Results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: test-results-${{ inputs.app-name }}
-          path: coverage/
-          retention-days: 30
-
-      - name: Upload Security Audit
+      - name: Upload Security Audit Report
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: security-audit-${{ inputs.app-name }}
-          path: npm-audit.txt
+          path: |
+            npm-audit.txt
+            npm-audit.json
           retention-days: 30
 
-      - name: Generate Test Summary
-        if: always()
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Unit Tests with Coverage
         run: |
-          echo "## Test Summary" >> $GITHUB_STEP_SUMMARY
-          echo "Tests completed for ${{ inputs.app-name }}" >> $GITHUB_STEP_SUMMARY
+          npm test -- --coverage \
+            --coverageReporters=json-summary \
+            --coverageReporters=lcov \
+            --passWithNoTests || true
+        env:
+          CI: true
+
+      - name: Check Coverage Threshold
+        run: |
+          if [ -f coverage/coverage-summary.json ]; then
+            COVERAGE=$(cat coverage/coverage-summary.json | jq -r '.total.lines.pct')
+            echo "Coverage: ${COVERAGE}%"
+            if (( $(echo "$COVERAGE < ${{ inputs.coverage-threshold }}" | bc -l) )); then
+              echo "::warning::Coverage ${COVERAGE}% is below threshold ${{ inputs.coverage-threshold }}%"
+            fi
+          fi
+
+      - name: Upload Coverage Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report-${{ inputs.app-name }}
+          path: coverage/
+          retention-days: 30
+
+  # ===========================================================================
+  # PHASE 2: Expo Doctor Check
+  # ===========================================================================
+
+  expo-doctor:
+    name: Expo Doctor
+    needs: [format-check, lint, type-check, security-scan, unit-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Expo Doctor
+        run: npx expo-doctor || true
+
+  # ===========================================================================
+  # CI Summary
+  # ===========================================================================
+
+  ci-summary:
+    name: CI Summary
+    needs: [format-check, lint, type-check, security-scan, unit-tests, expo-doctor]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "## CI Summary for ${{ inputs.app-name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Format Check | ${{ needs.format-check.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Lint | ${{ needs.lint.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Type Check | ${{ needs.type-check.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Scan | ${{ needs.security-scan.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Unit Tests | ${{ needs.unit-tests.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Expo Doctor | ${{ needs.expo-doctor.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # PHASE 3: Optional EAS Build (iOS)
+  # ===========================================================================
+
+  build-ios:
+    name: Build iOS
+    needs: [format-check, lint, type-check, security-scan, unit-tests]
+    if: inputs.build-ios && inputs.enable-deployment && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Setup EAS
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Build iOS
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            npx eas build --platform ios --profile production --non-interactive
+          else
+            npx eas build --platform ios --profile preview --non-interactive
+          fi
+
+  # ===========================================================================
+  # PHASE 3: Optional EAS Build (Android)
+  # ===========================================================================
+
+  build-android:
+    name: Build Android
+    needs: [format-check, lint, type-check, security-scan, unit-tests]
+    if: inputs.build-android && inputs.enable-deployment && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Setup EAS
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Build Android
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            npx eas build --platform android --profile production --non-interactive
+          else
+            npx eas build --platform android --profile preview --non-interactive
+          fi
