@@ -165,7 +165,7 @@ jobs:
       # Generate Test Summary
       - name: Generate Test Summary
         if: always()
-        uses: tripalta/tripalta-workflows/actions/test-summary@main
+        uses: TripAlta/tripalta-workflows/actions/test-summary@main
         with:
           test-results-path: test-results
           coverage-path: coverage/coverage-summary.json
