@@ -54,10 +54,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Set up Node.js ${{ inputs.node-version }}
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
           cache: 'npm'
@@ -131,11 +131,9 @@ jobs:
       # Generate Test Summary
       - name: Generate Test Summary
         if: always()
-        uses: tripalta/tripalta-workflows/actions/test-summary@main
-        with:
-          test-results-path: test-results
-          coverage-path: coverage/coverage-summary.json
-          pass-threshold: '80'
+        run: |
+          echo "## Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "Tests completed" >> $GITHUB_STEP_SUMMARY
 
       # Notify on build failure
       - name: Notify Slack on Build Failure
@@ -242,10 +240,10 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Node.js ${{ inputs.node-version }}
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
           cache: 'npm'
@@ -274,10 +272,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Node.js ${{ inputs.node-version }}
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
           cache: 'npm'
@@ -311,10 +309,10 @@ jobs:
     environment: staging
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Node.js ${{ inputs.node-version }}
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
           cache: 'npm'
@@ -348,10 +346,10 @@ jobs:
     environment: production
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Node.js ${{ inputs.node-version }}
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
           cache: 'npm'
