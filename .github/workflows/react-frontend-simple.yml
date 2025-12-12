@@ -7,6 +7,46 @@ on:
         description: 'Name of the application'
         required: true
         type: string
+      node-version:
+        description: 'Node.js version'
+        required: false
+        type: string
+        default: '20'
+      run-e2e-tests:
+        description: 'Run E2E tests'
+        required: false
+        type: boolean
+        default: true
+      run-accessibility-tests:
+        description: 'Run a11y tests'
+        required: false
+        type: boolean
+        default: true
+      enable-slack-notifications:
+        description: 'Slack notifications'
+        required: false
+        type: boolean
+        default: true
+      enable-bundle-size-check:
+        description: 'Bundle size check'
+        required: false
+        type: boolean
+        default: true
+      enable-pr-preview:
+        description: 'PR preview'
+        required: false
+        type: boolean
+        default: true
+      coverage-threshold:
+        description: 'Coverage threshold'
+        required: false
+        type: string
+        default: '60'
+      bundle-size-limit-kb:
+        description: 'Bundle size limit'
+        required: false
+        type: string
+        default: '50'
 
 jobs:
   format-check:
