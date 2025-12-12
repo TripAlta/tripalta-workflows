@@ -37,16 +37,6 @@ on:
         required: false
         type: boolean
         default: false
-      enable-dependency-check:
-        description: 'Whether to run dependency vulnerability check (disabled temporarily)'
-        required: false
-        type: boolean
-        default: false
-      enable-integration-tests:
-        description: 'Whether to run integration tests (disabled temporarily)'
-        required: false
-        type: boolean
-        default: false
 
 concurrency:
   group: python-${{ github.workflow }}-${{ github.ref }}
@@ -179,7 +169,6 @@ jobs:
   dependency-check:
     name: Dependency Vulnerability Check
     runs-on: ubuntu-latest
-    if: ${{ inputs.enable-dependency-check }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -267,7 +256,7 @@ jobs:
     name: Integration Tests
     runs-on: ubuntu-latest
     needs: [format-check, import-check, lint, type-check, security-scan, dependency-check, unit-tests]
-    if: ${{ inputs.enable-integration-tests }}
+    if: ${{ inputs.run-integration-tests }}
     env:
       POSTGRES_USER: test_user
       POSTGRES_PASSWORD: test_password
@@ -781,12 +770,13 @@ jobs:
           echo "| Unit Tests | ${{ needs.unit-tests.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Integration Tests | ${{ needs.integration-tests.result }} |" >> $GITHUB_STEP_SUMMARY
 
-          # Fail if critical jobs failed (skipped jobs are OK)
+          # Fail if critical jobs failed
           if [ "${{ needs.format-check.result }}" == "failure" ] || \
              [ "${{ needs.import-check.result }}" == "failure" ] || \
              [ "${{ needs.lint.result }}" == "failure" ] || \
              [ "${{ needs.type-check.result }}" == "failure" ] || \
-             [ "${{ needs.unit-tests.result }}" == "failure" ]; then
+             [ "${{ needs.unit-tests.result }}" == "failure" ] || \
+             [ "${{ needs.integration-tests.result }}" == "failure" ]; then
             echo ""
             echo "Critical job(s) failed - CI Pipeline Failed"
             exit 1
