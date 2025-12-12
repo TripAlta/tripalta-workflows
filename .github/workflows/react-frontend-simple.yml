@@ -48,6 +48,10 @@ on:
         type: string
         default: '50'
 
+concurrency:
+  group: react-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   format-check:
     name: Format Check
