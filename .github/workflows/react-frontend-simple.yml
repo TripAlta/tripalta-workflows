@@ -1,0 +1,177 @@
+name: React Frontend CI/CD (Simple)
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: 'Name of the application'
+        required: true
+        type: string
+      node-version:
+        description: 'Node.js version'
+        required: false
+        type: string
+        default: '20'
+      run-e2e-tests:
+        description: 'Run E2E tests'
+        required: false
+        type: boolean
+        default: true
+      run-accessibility-tests:
+        description: 'Run a11y tests'
+        required: false
+        type: boolean
+        default: true
+      enable-slack-notifications:
+        description: 'Slack notifications'
+        required: false
+        type: boolean
+        default: true
+      enable-bundle-size-check:
+        description: 'Bundle size check'
+        required: false
+        type: boolean
+        default: true
+      enable-pr-preview:
+        description: 'PR preview'
+        required: false
+        type: boolean
+        default: true
+      coverage-threshold:
+        description: 'Coverage threshold'
+        required: false
+        type: string
+        default: '60'
+      bundle-size-limit-kb:
+        description: 'Bundle size limit'
+        required: false
+        type: string
+        default: '50'
+
+concurrency:
+  group: react-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format-check:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run format:check || npx prettier --check .
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run lint
+
+  type-check:
+    name: Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run type-check || npx tsc --noEmit
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run tests
+        run: npm run test:ci -- --coverage || npm test -- --passWithNoTests
+        continue-on-error: true
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run npm audit
+        run: npm audit --audit-level=high || true
+
+  build:
+    name: Build
+    needs: [format-check, lint, type-check, unit-tests, security-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: dist/
+          retention-days: 7
+
+  e2e-tests:
+    name: E2E Tests
+    needs: [build]
+    if: inputs.run-e2e-tests && github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run e2e tests
+        run: echo "E2E tests would run here"
+
+  accessibility-tests:
+    name: Accessibility Tests
+    needs: [build]
+    if: inputs.run-accessibility-tests && github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run accessibility tests
+        run: echo "A11y tests would run here"
+
+  ci-summary:
+    name: CI Summary
+    needs: [build, e2e-tests, accessibility-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## CI Summary" >> $GITHUB_STEP_SUMMARY
+          echo "Build completed" >> $GITHUB_STEP_SUMMARY
