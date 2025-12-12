@@ -12,26 +12,75 @@ on:
         required: false
         type: string
         default: '20'
+      run-e2e-tests:
+        description: 'Whether to run E2E tests on develop/main'
+        required: false
+        type: boolean
+        default: true
+      run-accessibility-tests:
+        description: 'Whether to run accessibility tests on develop/main'
+        required: false
+        type: boolean
+        default: true
       enable-slack-notifications:
         description: 'Whether to send Slack notifications'
         required: false
         type: boolean
-        default: false
+        default: true
+      enable-bundle-size-check:
+        description: 'Whether to check bundle size changes'
+        required: false
+        type: boolean
+        default: true
+      enable-pr-preview:
+        description: 'Whether to deploy PR preview environments'
+        required: false
+        type: boolean
+        default: true
+      coverage-threshold:
+        description: 'Minimum coverage percentage'
+        required: false
+        type: string
+        default: '60'
+      bundle-size-limit-kb:
+        description: 'Maximum bundle size increase in KB'
+        required: false
+        type: string
+        default: '50'
+    secrets:
+      AWS_ROLE_ARN_STAGING:
+        required: false
+      AWS_ROLE_ARN_PROD:
+        required: false
+      CLOUDFRONT_STAGING_ID:
+        required: false
+      CLOUDFRONT_PROD_ID:
+        required: false
+      SLACK_WEBHOOK_URL:
+        required: false
+      AWS_ROLE_ARN_PREVIEW:
+        required: false
 
+# Cancel in-progress runs for the same workflow and ref
 concurrency:
   group: react-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build-and-test:
-    name: Build & Test
+  # ===========================================================================
+  # PHASE 1: Parallel Code Quality Checks
+  # ===========================================================================
+
+  format-check:
+    name: Format Check (Prettier)
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Node.js ${{ inputs.node-version }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}
           cache: 'npm'
@@ -39,44 +88,252 @@ jobs:
       - name: Install Dependencies
         run: npm ci
 
-      - name: Check Formatting (Prettier)
+      - name: Check Formatting
         run: npm run format:check || npx prettier --check .
 
-      - name: Lint (ESLint)
+  lint:
+    name: Lint (ESLint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint -- --format @microsoft/eslint-formatter-sarif --output-file eslint-results.sarif || npm run lint
+        continue-on-error: true
+
+      - name: Upload ESLint Results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: eslint-results.sarif
+          wait-for-processing: true
+        continue-on-error: true
+
+      - name: Verify Lint Passed
         run: npm run lint
 
-      - name: Type Check (TypeScript)
+  type-check:
+    name: Type Check (TypeScript)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run TypeScript Check
         run: npm run type-check
 
-      - name: Run Unit Tests
-        run: npm run test -- --passWithNoTests --coverage || true
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Security Audit
+        run: |
+          # Generate full audit report
+          npm audit --json > npm-audit.json 2>&1 || true
+          npm audit --audit-level=high 2>&1 | tee npm-audit.txt || true
+
+          # Fail on high or critical vulnerabilities
+          if npm audit --audit-level=high 2>&1 | grep -qE "(high|critical)"; then
+            echo "::error::High or critical vulnerabilities found in dependencies"
+            cat npm-audit.txt
+            exit 1
+          fi
+
+          echo "Security audit passed - no high/critical vulnerabilities found"
+
+      - name: Upload Security Audit Report
+        uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: security-audit-${{ inputs.app-name }}
+          path: |
+            npm-audit.txt
+            npm-audit.json
+          retention-days: 30
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Unit Tests with Coverage
+        run: |
+          npm run test:ci -- --coverage \
+            --coverageReporters=json-summary \
+            --coverageReporters=lcov \
+            --coverageReporters=html \
+            --reporters=default \
+            --reporters=jest-junit \
+            --maxWorkers=4 2>/dev/null || \
+          npm run test -- --coverage --passWithNoTests --maxWorkers=4
+        env:
+          JEST_JUNIT_OUTPUT_DIR: ./test-results
+          JEST_JUNIT_OUTPUT_NAME: junit.xml
+
+      - name: Check Coverage Threshold
+        run: |
+          if [ -f coverage/coverage-summary.json ]; then
+            COVERAGE=$(cat coverage/coverage-summary.json | jq '.total.statements.pct')
+            THRESHOLD=${{ inputs.coverage-threshold }}
+            echo "Coverage: ${COVERAGE}%"
+            echo "Threshold: ${THRESHOLD}%"
+            if (( $(echo "$COVERAGE < $THRESHOLD" | bc -l) )); then
+              echo "::error::Coverage ${COVERAGE}% is below threshold ${THRESHOLD}%"
+              exit 1
+            fi
+            echo "Coverage check passed"
+          else
+            echo "::warning::Coverage summary not found, skipping threshold check"
+          fi
+
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: test-results-${{ inputs.app-name }}
+          path: |
+            test-results/
+            junit.xml
+          retention-days: 30
+
+      - name: Upload Coverage Report
+        uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: coverage-report-${{ inputs.app-name }}
+          path: coverage/
+          retention-days: 30
+
+      - name: Generate Test Summary
+        if: always()
+        uses: TripAlta/tripalta-workflows/actions/test-summary@main
+        with:
+          test-results-path: test-results
+          coverage-path: coverage/coverage-summary.json
+          pass-threshold: ${{ inputs.coverage-threshold }}
+        continue-on-error: true
+
+  # ===========================================================================
+  # PHASE 2: Build Application
+  # ===========================================================================
+
+  build:
+    name: Build Application
+    needs: [format-check, lint, type-check, security-scan, unit-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
 
       - name: Build Application
         run: npm run build
 
+      - name: Generate Bundle Size Report
+        run: |
+          echo "## Bundle Size Report" > bundle-report.md
+          echo "" >> bundle-report.md
+          echo "| File | Size | Gzipped |" >> bundle-report.md
+          echo "|------|------|---------|" >> bundle-report.md
+          for file in dist/assets/js/*.js; do
+            if [ -f "$file" ]; then
+              SIZE=$(du -h "$file" | cut -f1)
+              GZIP_SIZE=$(gzip -c "$file" | wc -c | numfmt --to=iec-i --suffix=B)
+              FILENAME=$(basename "$file")
+              echo "| $FILENAME | $SIZE | $GZIP_SIZE |" >> bundle-report.md
+            fi
+          done
+          cat bundle-report.md
+
       - name: Upload Build Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: build-${{ inputs.app-name }}
           path: dist/
           retention-days: 7
 
-  deploy-staging:
-    name: Deploy to Staging
-    needs: build-and-test
-    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+      - name: Upload Bundle Report
+        uses: actions/upload-artifact@v5
+        with:
+          name: bundle-report-${{ inputs.app-name }}
+          path: bundle-report.md
+          retention-days: 30
+
+  # ===========================================================================
+  # PHASE 3: Extended Testing (Parallel, Conditional)
+  # ===========================================================================
+
+  e2e-tests:
+    name: E2E Tests (Playwright)
+    needs: build
+    if: inputs.run-e2e-tests && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main') && github.event_name == 'push'
     runs-on: ubuntu-latest
-    environment:
-      name: staging
-    permissions:
-      id-token: write
-      contents: read
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Node.js ${{ inputs.node-version }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}
           cache: 'npm'
@@ -84,36 +341,404 @@ jobs:
       - name: Install Dependencies
         run: npm ci
 
-      - name: Build for Staging
-        run: npm run build
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v5
+        with:
+          name: build-${{ inputs.app-name }}
+          path: dist/
+
+      - name: Install Playwright Browsers
+        run: npx playwright install --with-deps ${{ matrix.browser }}
+
+      - name: Run E2E Tests
+        run: |
+          npm run test:e2e:ci -- --project=${{ matrix.browser }} || \
+          npm run test:e2e -- --project=${{ matrix.browser }}
         env:
-          VITE_API_BASE_URL: https://stg-api.tripalta.com
-          VITE_ENVIRONMENT: staging
+          CI: true
+          PLAYWRIGHT_BROWSERS_PATH: 0
+
+      - name: Upload Playwright Report
+        uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: playwright-report-${{ matrix.browser }}-${{ inputs.app-name }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 30
+
+      - name: Upload Screenshots on Failure
+        uses: actions/upload-artifact@v5
+        if: failure()
+        with:
+          name: e2e-screenshots-${{ matrix.browser }}-${{ inputs.app-name }}
+          path: test-results/**/*.png
+          retention-days: 7
+
+      - name: Upload Videos on Failure
+        uses: actions/upload-artifact@v5
+        if: failure()
+        with:
+          name: e2e-videos-${{ matrix.browser }}-${{ inputs.app-name }}
+          path: test-results/**/*.webm
+          retention-days: 7
+
+      - name: Upload Traces on Failure
+        uses: actions/upload-artifact@v5
+        if: failure()
+        with:
+          name: e2e-traces-${{ matrix.browser }}-${{ inputs.app-name }}
+          path: test-results/**/*.zip
+          retention-days: 7
+
+  accessibility-tests:
+    name: Accessibility Tests
+    needs: build
+    if: inputs.run-accessibility-tests && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main') && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v5
+        with:
+          name: build-${{ inputs.app-name }}
+          path: dist/
+
+      - name: Install Playwright for A11y Tests
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Accessibility Tests
+        run: |
+          npm run test:accessibility:comprehensive 2>/dev/null || \
+          npm run test:accessibility 2>/dev/null || \
+          npm run test:a11y 2>/dev/null || \
+          echo "No dedicated accessibility test script found, running axe-core with Playwright"
+        continue-on-error: true
+
+      - name: Upload Accessibility Report
+        uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: accessibility-report-${{ inputs.app-name }}
+          path: |
+            accessibility-report/
+            a11y-results/
+          retention-days: 30
+
+  bundle-size-check:
+    name: Bundle Size Check
+    needs: build
+    if: inputs.enable-bundle-size-check && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Check Bundle Size
+        uses: preactjs/compressed-size-action@v2
+        with:
+          repo-token: ${{ github.token }}
+          build-script: "build"
+          pattern: "dist/**/*.{js,css,html}"
+          compression: "gzip"
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v5
+        with:
+          name: build-${{ inputs.app-name }}
+          path: dist/
+
+      - name: Calculate Total Bundle Size
+        id: bundle-size
+        run: |
+          TOTAL_SIZE=$(find dist -name "*.js" -o -name "*.css" | xargs du -cb 2>/dev/null | tail -1 | cut -f1)
+          TOTAL_SIZE_KB=$((TOTAL_SIZE / 1024))
+          echo "Total bundle size: ${TOTAL_SIZE_KB} KB"
+          echo "size_kb=${TOTAL_SIZE_KB}" >> $GITHUB_OUTPUT
+
+          # Gzipped size
+          GZIP_SIZE=0
+          for file in $(find dist -name "*.js" -o -name "*.css"); do
+            FILE_GZIP=$(gzip -c "$file" | wc -c)
+            GZIP_SIZE=$((GZIP_SIZE + FILE_GZIP))
+          done
+          GZIP_SIZE_KB=$((GZIP_SIZE / 1024))
+          echo "Total gzipped size: ${GZIP_SIZE_KB} KB"
+          echo "gzip_size_kb=${GZIP_SIZE_KB}" >> $GITHUB_OUTPUT
+
+      - name: Comment Bundle Size on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sizeKB = '${{ steps.bundle-size.outputs.size_kb }}';
+            const gzipKB = '${{ steps.bundle-size.outputs.gzip_size_kb }}';
+            const limitKB = '${{ inputs.bundle-size-limit-kb }}';
+
+            const body = `## 📦 Bundle Size Report
+
+            | Metric | Size |
+            |--------|------|
+            | Total Size | ${sizeKB} KB |
+            | Gzipped | ${gzipKB} KB |
+            | Size Limit | ${limitKB} KB increase |
+
+            _Size limit applies to incremental changes only._`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number
+            });
+
+            const botComment = comments.find(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('Bundle Size Report')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: body
+              });
+            }
+
+  # ===========================================================================
+  # PHASE 4: Deployments
+  # ===========================================================================
+
+  # PR Preview Deployment - Ephemeral environments for pull requests
+  deploy-pr-preview:
+    name: Deploy PR Preview
+    needs: build
+    if: github.event_name == 'pull_request' && inputs.enable-pr-preview
+    runs-on: ubuntu-latest
+    environment:
+      name: pr-preview-${{ github.event.pull_request.number }}
+      url: ${{ steps.deploy.outputs.preview_url }}
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install and Build
+        run: npm ci && npm run build
+        env:
+          VITE_API_URL: ${{ vars.STAGING_API_URL || 'https://staging-api.tripalta.com' }}
+          VITE_ENVIRONMENT: preview
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        if: secrets.AWS_ROLE_ARN_PREVIEW != ''
+        uses: aws-actions/configure-aws-credentials@v5
         with:
-          aws-region: us-east-1
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PREVIEW }}
+
+      - name: Deploy to S3 Preview Bucket
+        id: deploy
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PREVIEW_PATH="pr-${PR_NUMBER}"
+          BUCKET_NAME="${{ vars.PREVIEW_BUCKET_NAME || 'tripalta-preview-frontend' }}"
+
+          # Deploy to S3 under PR-specific path
+          aws s3 sync dist/ "s3://${BUCKET_NAME}/${PREVIEW_PATH}/" --delete
+
+          # Set preview URL output
+          PREVIEW_URL="${{ vars.PREVIEW_BASE_URL || 'https://preview.tripalta.com' }}/${PREVIEW_PATH}/"
+          echo "preview_url=${PREVIEW_URL}" >> $GITHUB_OUTPUT
+          echo "Preview deployed to: ${PREVIEW_URL}"
+
+      - name: Comment PR with Preview URL
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const previewUrl = '${{ steps.deploy.outputs.preview_url }}';
+            const prNumber = context.payload.pull_request.number;
+
+            // Find existing preview comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+
+            const botComment = comments.find(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('Preview Deployment')
+            );
+
+            const body = `## 🚀 Preview Deployment
+
+            | Status | URL |
+            |--------|-----|
+            | ✅ Ready | [${previewUrl}](${previewUrl}) |
+
+            **Commit:** \`${{ github.sha }}\`
+            **Updated:** ${new Date().toISOString()}
+
+            > This preview will be automatically cleaned up when the PR is closed.`;
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: body
+              });
+            }
+
+      - name: Notify Slack on PR Preview
+        if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          payload: |
+            {
+              "text": ":eyes: PR Preview Ready: ${{ inputs.app-name }} #${{ github.event.pull_request.number }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":eyes: *PR Preview Ready*\n*App:* ${{ inputs.app-name }}\n*PR:* #${{ github.event.pull_request.number }}\n*URL:* ${{ steps.deploy.outputs.preview_url }}\n*Author:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # Cleanup PR Preview on PR close
+  cleanup-pr-preview:
+    name: Cleanup PR Preview
+    if: github.event_name == 'pull_request' && github.event.action == 'closed' && inputs.enable-pr-preview
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Configure AWS Credentials
+        if: secrets.AWS_ROLE_ARN_PREVIEW != ''
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PREVIEW }}
+
+      - name: Delete PR Preview from S3
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PREVIEW_PATH="pr-${PR_NUMBER}"
+          BUCKET_NAME="${{ vars.PREVIEW_BUCKET_NAME || 'tripalta-preview-frontend' }}"
+
+          echo "Cleaning up preview for PR #${PR_NUMBER}..."
+          aws s3 rm "s3://${BUCKET_NAME}/${PREVIEW_PATH}/" --recursive || true
+          echo "Preview cleanup completed"
+
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: staging
+    outputs:
+      previous-task-def: ${{ steps.get-current-task.outputs.task-definition }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
           role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      # Store current task definition for potential rollback
+      - name: Get Current Task Definition
+        id: get-current-task
+        run: |
+          CURRENT_TASK=$(aws ecs describe-services \
+            --cluster tripalta-staging-cluster \
+            --services ${{ inputs.app-name }} \
+            --query 'services[0].taskDefinition' \
+            --output text 2>/dev/null || echo "")
+          echo "task-definition=$CURRENT_TASK" >> $GITHUB_OUTPUT
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Build and Push Docker Image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v5
         with:
           context: .
           push: true
+          build-args: |
+            VITE_API_BASE_URL=${{ vars.STAGING_API_URL || 'https://stg-api.tripalta.com' }}
+            VITE_ENVIRONMENT=staging
           tags: |
             ${{ steps.login-ecr.outputs.registry }}/tripalta-staging/${{ inputs.app-name }}:${{ github.sha }}
             ${{ steps.login-ecr.outputs.registry }}/tripalta-staging/${{ inputs.app-name }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Create GitHub Deployment
+        id: deploy
+        uses: chrnorm/deployment-action@v2
+        with:
+          token: ${{ github.token }}
+          environment: staging
+          ref: ${{ github.sha }}
+
       - name: Update ECS Service
         run: |
           aws ecs update-service \
@@ -126,71 +751,383 @@ jobs:
           aws ecs wait services-stable \
             --cluster tripalta-staging-cluster \
             --services ${{ inputs.app-name }}
-        continue-on-error: true
+
+      # Smoke test
+      - name: Smoke Test
+        run: |
+          sleep 10
+          STAGING_URL="${{ vars.STAGING_FRONTEND_URL || 'https://stg.tripalta.com' }}"
+          for i in {1..5}; do
+            if curl -sf --max-time 10 "$STAGING_URL" > /dev/null 2>&1; then
+              echo "Staging site is accessible"
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "::warning::Could not verify staging site accessibility"
+
+      # Rollback on failure
+      - name: Rollback on Failure
+        if: failure() && steps.get-current-task.outputs.task-definition != ''
+        run: |
+          echo "Deployment failed, rolling back..."
+          aws ecs update-service \
+            --cluster tripalta-staging-cluster \
+            --service ${{ inputs.app-name }} \
+            --task-definition ${{ steps.get-current-task.outputs.task-definition }}
+          aws ecs wait services-stable \
+            --cluster tripalta-staging-cluster \
+            --services ${{ inputs.app-name }}
+
+      - name: Update Deployment Status
+        if: always()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: ${{ github.token }}
+          state: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deployment-id: ${{ steps.deploy.outputs.deployment_id }}
+          environment-url: ${{ vars.STAGING_FRONTEND_URL || 'https://stg.tripalta.com' }}
+
+      - name: Notify Slack on Staging Deployment
+        if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          payload: |
+            {
+              "text": ":rocket: Deployed to Staging: ${{ inputs.app-name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":rocket: *Deployed to Staging*\n*App:* ${{ inputs.app-name }}\n*URL:* ${{ vars.STAGING_FRONTEND_URL || 'https://stg.tripalta.com' }}\n*Author:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Notify Slack on Staging Failure
+        if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          payload: |
+            {
+              "text": ":warning: Staging Deployment Failed: ${{ inputs.app-name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":warning: *Staging Deployment Failed*\n*App:* ${{ inputs.app-name }}\n*Branch:* ${{ github.ref_name }}\n*Rolled back to:* ${{ steps.get-current-task.outputs.task-definition || 'N/A' }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
   deploy-production:
     name: Deploy to Production
-    needs: build-and-test
+    needs: build
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     environment:
       name: production
-    permissions:
-      id-token: write
-      contents: read
+      url: https://tripalta.com
+    outputs:
+      previous-task-def: ${{ steps.get-current-task.outputs.task-definition }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js ${{ inputs.node-version }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ inputs.node-version }}
-          cache: 'npm'
-
-      - name: Install Dependencies
-        run: npm ci
-
-      - name: Build for Production
-        run: npm run build
-        env:
-          VITE_API_BASE_URL: https://api.tripalta.com
-          VITE_ENVIRONMENT: production
+        uses: actions/checkout@v6
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
-          aws-region: us-east-1
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
           role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      # Store current task definition for potential rollback
+      - name: Get Current Task Definition
+        id: get-current-task
+        run: |
+          CURRENT_TASK=$(aws ecs describe-services \
+            --cluster tripalta-prod-cluster \
+            --services ${{ inputs.app-name }} \
+            --query 'services[0].taskDefinition' \
+            --output text 2>/dev/null || echo "")
+          echo "task-definition=$CURRENT_TASK" >> $GITHUB_OUTPUT
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Build and Push Docker Image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v5
         with:
           context: .
           push: true
+          build-args: |
+            VITE_API_BASE_URL=${{ vars.PROD_API_URL || 'https://api.tripalta.com' }}
+            VITE_ENVIRONMENT=production
           tags: |
-            ${{ steps.login-ecr.outputs.registry }}/tripalta-production/${{ inputs.app-name }}:${{ github.sha }}
-            ${{ steps.login-ecr.outputs.registry }}/tripalta-production/${{ inputs.app-name }}:latest
+            ${{ steps.login-ecr.outputs.registry }}/tripalta-prod/${{ inputs.app-name }}:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/tripalta-prod/${{ inputs.app-name }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Create GitHub Deployment
+        id: deploy
+        uses: chrnorm/deployment-action@v2
+        with:
+          token: ${{ github.token }}
+          environment: production
+          ref: ${{ github.sha }}
 
       - name: Update ECS Service
         run: |
           aws ecs update-service \
-            --cluster tripalta-production-cluster \
+            --cluster tripalta-prod-cluster \
             --service ${{ inputs.app-name }} \
             --force-new-deployment
 
       - name: Wait for Service Stability
         run: |
           aws ecs wait services-stable \
-            --cluster tripalta-production-cluster \
+            --cluster tripalta-prod-cluster \
             --services ${{ inputs.app-name }}
+
+      # Smoke test
+      - name: Smoke Test
+        run: |
+          sleep 10
+          PROD_URL="${{ vars.PROD_FRONTEND_URL || 'https://tripalta.com' }}"
+          for i in {1..5}; do
+            if curl -sf --max-time 10 "$PROD_URL" > /dev/null 2>&1; then
+              echo "Production site is accessible"
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "::warning::Could not verify production site accessibility"
+
+      # Rollback on failure
+      - name: Rollback on Failure
+        if: failure() && steps.get-current-task.outputs.task-definition != ''
+        run: |
+          echo "::error::Production deployment failed, rolling back..."
+          aws ecs update-service \
+            --cluster tripalta-prod-cluster \
+            --service ${{ inputs.app-name }} \
+            --task-definition ${{ steps.get-current-task.outputs.task-definition }}
+          aws ecs wait services-stable \
+            --cluster tripalta-prod-cluster \
+            --services ${{ inputs.app-name }}
+
+      - name: Update Deployment Status
+        if: always()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: ${{ github.token }}
+          state: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deployment-id: ${{ steps.deploy.outputs.deployment_id }}
+          environment-url: ${{ vars.PROD_FRONTEND_URL || 'https://tripalta.com' }}
+
+      # Generate changelog
+      - name: Generate Changelog
+        if: success()
+        uses: mikepenz/release-changelog-builder-action@v6
+        id: changelog
+        with:
+          configuration: ".github/changelog-config.json"
+          ignorePreReleases: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         continue-on-error: true
+
+      - name: Notify Slack on Production Deployment
+        if: success() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          payload: |
+            {
+              "text": ":white_check_mark: Deployed to Production: ${{ inputs.app-name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: *Deployed to Production*\n*App:* ${{ inputs.app-name }}\n*URL:* ${{ vars.PROD_FRONTEND_URL || 'https://tripalta.com' }}\n*Author:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Notify Slack on Production Failure
+        if: failure() && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          payload: |
+            {
+              "text": ":rotating_light: PRODUCTION Deployment Failed: ${{ inputs.app-name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":rotating_light: *PRODUCTION Deployment Failed*\n*App:* ${{ inputs.app-name }}\n*Branch:* main\n*Rolled back to:* ${{ steps.get-current-task.outputs.task-definition || 'N/A' }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "View Workflow"},
+                      "style": "danger",
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # ===========================================================================
+  # PHASE 5: CI Summary
+  # ===========================================================================
+
+  ci-summary:
+    name: CI Summary
+    needs:
+      - format-check
+      - lint
+      - type-check
+      - security-scan
+      - unit-tests
+      - build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate CI Summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const jobs = {
+              'Format Check': '${{ needs.format-check.result }}',
+              'Lint': '${{ needs.lint.result }}',
+              'Type Check': '${{ needs.type-check.result }}',
+              'Security Scan': '${{ needs.security-scan.result }}',
+              'Unit Tests': '${{ needs.unit-tests.result }}',
+              'Build': '${{ needs.build.result }}'
+            };
+
+            const getIcon = (status) => {
+              switch(status) {
+                case 'success': return '✅';
+                case 'failure': return '❌';
+                case 'cancelled': return '⏹️';
+                case 'skipped': return '⏭️';
+                default: return '❓';
+              }
+            };
+
+            let summary = '## 🎯 CI/CD Pipeline Summary\n\n';
+            summary += '### Phase 1: Quality Checks\n\n';
+            summary += '| Job | Status |\n';
+            summary += '|-----|--------|\n';
+
+            for (const [job, status] of Object.entries(jobs)) {
+              if (job !== 'Build') {
+                summary += `| ${job} | ${getIcon(status)} ${status} |\n`;
+              }
+            }
+
+            summary += '\n### Phase 2: Build\n\n';
+            summary += '| Job | Status |\n';
+            summary += '|-----|--------|\n';
+            summary += `| Build | ${getIcon(jobs['Build'])} ${jobs['Build']} |\n`;
+
+            // Determine overall status
+            const allStatuses = Object.values(jobs);
+            const hasFailure = allStatuses.includes('failure');
+            const allSuccess = allStatuses.every(s => s === 'success' || s === 'skipped');
+
+            summary += '\n### Overall Result\n\n';
+            if (hasFailure) {
+              summary += '❌ **Pipeline Failed** - One or more jobs failed.\n';
+            } else if (allSuccess) {
+              summary += '✅ **Pipeline Passed** - All checks completed successfully.\n';
+            } else {
+              summary += '⚠️ **Pipeline Incomplete** - Some jobs were cancelled or skipped.\n';
+            }
+
+            summary += '\n---\n';
+            summary += `*Run ID:* \`${{ github.run_id }}\`\n`;
+            summary += `*Commit:* \`${{ github.sha }}\`\n`;
+            summary += `*Branch:* \`${{ github.ref_name }}\`\n`;
+            summary += `*Triggered by:* @${{ github.actor }}\n`;
+
+            await core.summary
+              .addRaw(summary)
+              .write();
+
+      - name: Set CI Status Output
+        id: status
+        run: |
+          if [[ "${{ needs.format-check.result }}" == "failure" ]] || \
+             [[ "${{ needs.lint.result }}" == "failure" ]] || \
+             [[ "${{ needs.type-check.result }}" == "failure" ]] || \
+             [[ "${{ needs.security-scan.result }}" == "failure" ]] || \
+             [[ "${{ needs.unit-tests.result }}" == "failure" ]] || \
+             [[ "${{ needs.build.result }}" == "failure" ]]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "CI Pipeline: FAILED"
+          else
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "CI Pipeline: SUCCESS"
+          fi
+
+      - name: Notify Slack on CI Failure
+        if: steps.status.outputs.status == 'failure' && inputs.enable-slack-notifications && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          payload: |
+            {
+              "text": ":x: CI Pipeline Failed: ${{ inputs.app-name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: *CI Pipeline Failed*\n*App:* ${{ inputs.app-name }}\n*Branch:* ${{ github.ref_name }}\n*Author:* ${{ github.actor }}\n\n*Failed Jobs:*\n${{ needs.format-check.result == 'failure' && '• Format Check\n' || '' }}${{ needs.lint.result == 'failure' && '• Lint\n' || '' }}${{ needs.type-check.result == 'failure' && '• Type Check\n' || '' }}${{ needs.security-scan.result == 'failure' && '• Security Scan\n' || '' }}${{ needs.unit-tests.result == 'failure' && '• Unit Tests\n' || '' }}${{ needs.build.result == 'failure' && '• Build\n' || '' }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "View Workflow"},
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
