@@ -42,7 +42,7 @@ on:
       SLACK_WEBHOOK_URL:
         required: false
 
-# Cancel in-progress runs for the same workflow and ref
+# Cancel in-progress runs for the same workflow and ref (updated 2025-12-11)
 concurrency:
   group: mobile-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
