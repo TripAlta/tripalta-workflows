@@ -47,6 +47,11 @@ on:
         required: false
         type: string
         default: '50'
+      enable-deployment:
+        description: 'Whether to deploy to staging/production (requires AWS infrastructure)'
+        required: false
+        type: boolean
+        default: true
 
 # Cancel in-progress runs for the same workflow and ref
 concurrency:
@@ -671,7 +676,7 @@ jobs:
   deploy-staging:
     name: Deploy to Staging
     needs: build
-    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    if: inputs.enable-deployment && github.ref == 'refs/heads/develop' && github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: staging
     outputs:
@@ -821,7 +826,7 @@ jobs:
   deploy-production:
     name: Deploy to Production
     needs: build
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: inputs.enable-deployment && github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     environment:
       name: production
