@@ -320,10 +320,10 @@ jobs:
           path: dist/
           retention-days: 7
 
-      # Generate Test Summary
-      - name: Generate Test Summary
+      # Upload Bundle Size Report
+      - name: Upload Bundle Size Report
         if: always()
-        uses: TripAlta/tripalta-workflows/actions/test-summary@main
+        uses: actions/upload-artifact@v5
         with:
           name: bundle-report-${{ inputs.app-name }}
           path: bundle-report.md
