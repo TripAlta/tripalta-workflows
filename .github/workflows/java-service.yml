@@ -228,6 +228,7 @@ jobs:
 
       - name: Generate JaCoCo Report
         run: ./mvnw jacoco:report -q || true
+        continue-on-error: true
 
       - name: Upload Unit Test Results
         uses: actions/upload-artifact@v4
@@ -326,6 +327,7 @@ jobs:
 
       - name: Generate JaCoCo Report
         run: ./mvnw jacoco:report -q || true
+        continue-on-error: true
 
       - name: Upload Integration Test Results
         uses: actions/upload-artifact@v4
