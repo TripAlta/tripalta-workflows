@@ -403,7 +403,7 @@ jobs:
           if [ "${{ github.ref }}" == "refs/heads/develop" ]; then
             echo "prefix=tripalta-staging" >> $GITHUB_OUTPUT
           else
-            echo "prefix=tripalta-production" >> $GITHUB_OUTPUT
+            echo "prefix=tripalta-prod" >> $GITHUB_OUTPUT
           fi
 
       - name: Docker metadata
@@ -624,7 +624,7 @@ jobs:
         id: get-current-task
         run: |
           CURRENT_TASK=$(aws ecs describe-services \
-            --cluster tripalta-production-cluster \
+            --cluster tripalta-prod-cluster \
             --services ${{ inputs.service-name }} \
             --query 'services[0].taskDefinition' \
             --output text 2>/dev/null || echo "")
@@ -642,14 +642,14 @@ jobs:
       - name: Update ECS Service
         run: |
           aws ecs update-service \
-            --cluster tripalta-production-cluster \
+            --cluster tripalta-prod-cluster \
             --service ${{ inputs.service-name }} \
             --force-new-deployment
 
       - name: Wait for Service Stability
         run: |
           aws ecs wait services-stable \
-            --cluster tripalta-production-cluster \
+            --cluster tripalta-prod-cluster \
             --services ${{ inputs.service-name }}
 
       - name: Smoke Test
@@ -672,11 +672,11 @@ jobs:
         run: |
           echo "::error::Production deployment failed, rolling back..."
           aws ecs update-service \
-            --cluster tripalta-production-cluster \
+            --cluster tripalta-prod-cluster \
             --service ${{ inputs.service-name }} \
             --task-definition ${{ steps.get-current-task.outputs.task-definition }}
           aws ecs wait services-stable \
-            --cluster tripalta-production-cluster \
+            --cluster tripalta-prod-cluster \
             --services ${{ inputs.service-name }}
 
       - name: Update Deployment Status
